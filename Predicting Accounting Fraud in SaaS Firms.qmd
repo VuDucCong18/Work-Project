@@ -1,0 +1,2919 @@
+---
+title: "ACCT420 Forecasting & Forensic Analytics Group Project - Group 2"
+subtitle: "Predicting Accounting Fraud in the Tech (SaaS) Industry"
+editor: visual
+echo: true
+warning: false
+format: 
+  html:
+    toc: true
+    toc-depth: 4
+    toc-location: right
+    toc-title: "Contents"
+    toc-expand: false
+    embed-resources: true
+knitr:
+  opts_chunk:
+    results: 'hold'
+---
+
+```{=html}
+  <style>
+    .subtitle {
+      font-size: 1.5rem;
+    }
+  </style>
+```
+
+## Introduction
+
+Accounting manipulation and fraudulent financial reporting pose **significant risks** to investors, regulators, and the overall integrity of capital markets. When such activities go undetected, the **consequences can be severe,** including bankruptcy, loss of investor confidence, stock price collapse, and substantial legal penalties. These risks highlight the critical need for **early and effective detection mechanisms.**
+
+This project is motivated by the need to support **forensic and Know-Your-Customer (KYC) processes,** such as those conducted by EY, in identifying high-risk firms. Specifically, it aims to develop a **machine learning model** that flags potentially fraudulent companies within the **technology and software (SaaS) industry**. By leveraging data-driven techniques, the model seeks to enhance risk identification, improve transparency, and assist stakeholders in making more informed decisions.
+
+The dataset used in this study is extracted from the **Wharton Research Data Services (WRDS) Worldscope database**, which contains over 500 financial variables. To establish ground truth labels for fraudulent cases, **Accounting and Auditing Enforcement Releases (AAER)** published by the U.S. Securities and Exchange Commission (SEC) are used to identify firms involved in accounting manipulation. Through this approach, the project integrates financial data with regulatory enforcement records to build a robust predictive framework for fraud detection.
+
+## Project Pipeline
+
+-   **Data Import & Column Mapping**
+
+    -   Extract firm-level financial data (X-variables) from WRDS Worldscope (2015-2025)
+    -   Extract all available AAER data from 1997 onwards via the API here <https://sec-api.io>
+
+-   **Feature Selection**
+
+    -   Review over 500 financial variables (X-variables).
+    -   Group and evaluate variables based on relevance to accounting fraud detection.
+    -   Select meaningful variables to construct the final datasets.
+
+-   **Data Cleaning & Preprocessing**
+
+    -   Handle missing values and data inconsistencies (X-variables).
+    -   Remove variables with more than 90% missing values (X-variables).
+    -   Winsorise the top and bottom 1% for variables with significant outliers (X-variables).
+    -   Obtain AAER fraud cases to serve as the ground truth (Y-variable).
+
+-   **Feature Engineering**
+
+    -   Create additional derived variables such as:
+        -   Financial ratios.
+        -   Applied natural logarithm to X variables with high skewness
+    -   Ensure engineered features are supported by prior accounting fraud literature.
+
+-   **Exploratory Data Analysis (EDA)**
+
+    -   Analyze variable distributions and patterns
+    -   Plot correlation matrices to understand relationships among variables.
+    -   Identify potential multicollinearity issues.
+
+-   **Model Development**
+
+    -   Split dataset into training and testing sets.
+    -   Train machine learning models to classify fraud vs non-fraud firms.
+
+-   **Model Evaluation**
+
+    -   Assess model performance using: AUC (Area Under Curve) and Confusion Matrix
+
+-   **Model Refinement**
+
+    -   Iterate on feature selection and model tuning.
+    -   Improve predictive performance and interpretability.
+
+## Data Import and Column Name Mapping
+
+```{r}
+#| results: hide
+gc()
+
+# Import all required libraries, and install them if necessary
+packages <- c(
+  "data.table",
+  "dplyr",
+  "caret",
+  "ROSE",
+  "randomForest",
+  "rpart",
+  "rpart.plot",
+  "glmnet",
+  "pROC",
+  "PRROC",
+  "ggplot2",
+  "gridExtra",
+  "remotes",
+  "xgboost",
+  "readr",
+  "jsonlite",
+  "tidyr",
+  "e1071",
+  "corrplot",
+  "stringr",
+  "lubridate",
+  "stringdist",
+  "fuzzyjoin"
+)
+
+installed <- rownames(installed.packages())
+to_install <- packages[!packages %in% installed]
+if (length(to_install) > 0) {
+  install.packages(to_install)
+}
+
+suppressPackageStartupMessages(
+  invisible(lapply(packages, library, character.only = TRUE))
+  # invisible(remotes::install_version("xgboost", version = "1.7.6.1")) # Ideal xgboost version
+)
+```
+
+### Import LSEG Dataset
+
+Firstly, we extracted all global annual accounting-related data from the London Stock Exchange (LSEG), particularly for Technology and Software (SaaS) companies, via the Wharton Research Data Services (WRDS) database. This dataset contains 470 unique columns and 689,412 unique rows from the years 2015 - 2025.
+
+```{r}
+# Read LSEG dataset (column names like ITEM5601, ITEM60001, etc.)
+lseg <- read_csv("../data/LSEG_dataset.csv")
+tail(lseg)
+```
+
+### Replace Headers with Meaningful Text
+
+Since the column names extracted from WRDS are labelled incoherently as `ITEM#####`, we'll import a WRDS code mapping (`csv`) which contains data on the columns `code` and `name`. This allows us to map all `ITEM#####` column names to their actual column names. Afterwhich, we check for any unmapped columns which returned 0.
+
+```{r}
+# Read WRDS code names
+code_map <- read_csv("../data/WRDS_code_names.csv")
+head(code_map)
+```
+
+```{r}
+# Ensure code column is character for matching
+code_map$code <- as.character(code_map$code)
+
+# Remove "ITEM" prefix from LSEG column names
+clean_codes <- gsub("^ITEM", "", colnames(lseg))
+
+# Create a lookup vector: names = numeric code, values = variable name
+code_lookup <- setNames(code_map$name, code_map$code)
+
+# Map LSEG columns to names if available, else keep original
+new_names <- ifelse(
+  clean_codes %in% names(code_lookup),
+  code_lookup[clean_codes],
+  colnames(lseg)  # keep original if no match
+)
+
+# Assign cleaned column names
+colnames(lseg) <- new_names
+
+# Preview first 20 cleaned column names
+print(head(colnames(lseg), 20))
+
+# Save cleaned dataset
+#write_csv(lseg, "../data/LSEG_dataset_cleaned.csv")
+
+#cat("Cleaning complete. File saved as: LSEG_dataset_cleaned.csv\n")
+```
+
+### Check for any unlabeled columns
+
+```{r}
+# Find columns still starting with "ITEM"
+unlabelled_cols <- colnames(lseg)[grepl("^ITEM", colnames(lseg))]
+
+# Print them
+print(unlabelled_cols)
+
+# Count how many
+cat("Number of unlabelled columns:", length(unlabelled_cols), "\n")
+```
+
+## Feature Selections
+
+Moving to the next stage of the project, feature selection involves narrowing down the most relevant variables from the LSEG dataset that are useful for predicting fraud. By reducing the dataset from 470 variables to a focused subset, we improve model interpretability while also addressing high-dimensionality issues like overfitting and unnecessary noise.
+
+### Stage 0: Keep Core Identifiers and Time
+
+We retain the **company identifier** and **fiscal period end date** to preserve panel integrity and allow proper chronological ordering. The company identifier is necessary for evaluation, grouped validation, and firm-level diagnostics, while the fiscal date ensures correct lag computation and prevents look-ahead bias.
+
+```{r}
+# Stage 0: Core keys + target
+cols_keys <- c(
+  "code",                                # Stable firm identifier
+  "FISCAL PERIOD END DATE (5350)",       # Time variable (for lag integrity)
+  "COMPANY STATUS (1000)"
+  )
+
+
+cat("Stage 0 complete\n")
+cat("Columns selected for X-variables:", ncol(cols_keys), "\n")
+```
+
+### Stage 1: Drop non-informative identifiers and text fields
+
+We remove fields that function mainly as labels, identifiers, or descriptive metadata (e.g., ticker/ISIN/CUSIP, short names, acronyms, business description). These variables typically do not capture economic behavior and can introduce entity memorization (the model learns firm identity rather than fraud patterns). We keep `code` and fiscal date from Stage 0 for linking and evaluation.
+
+```{r}
+# Stage 1: Identify columns to drop (IDs + descriptive text)
+cols_drop_stage1 <- c(
+  "TICKER SYMBOL (5601)",
+  "CUSIP (6004)",
+  "SEDOL NUMBER (6006)",
+  "ISIN NUMBER (6008)",
+  "I/B/E/S TICKER (6038)",
+  "WORLDSCOPE IDENTIFIER (6035)",
+  "WORLDSCOPE PERM I.D. (6105)",
+  "COMPANY NAME (6001)",          # keep firm id as 'code'; keep name only for reporting if needed
+  "COMPANY NAME - SHORT (6003)",
+  "ACRONYM (6014)",
+  "BUSINESS DESCRIPTION (6091)"
+)
+
+cat("Stage 1 complete\n")
+cat("Drop identity columns:", length(cols_drop_stage1), "\n")
+cat("Columns selected for X-variables:", ncol(cols_keys), "\n")
+```
+
+### Stage 2: Drop 5-year average and long-run summary fields
+
+We remove “5 YR AVG / 5 YEAR AVERAGE” variables because they are typically redundant with current-year ratios, increase missingness (especially for shorter-history firms), and can be recreated consistently later if needed (e.g., rolling averages computed within your panel).
+
+```{r}
+# Stage 3: Drop 5-year average fields (pattern-based)
+cols_drop_stage3 <- colnames(lseg)[
+  str_detect(colnames(lseg), " - 5 YR AVG| - 5 YEAR AVERAGE|5 YR AVG|5 YEAR AVERAGE")
+]
+
+
+cat("Stage 2 complete\n")
+cat("Dropped 5Y-avg columns:", length(cols_drop_stage3), "\n")
+cat("Columns selected for X-variables:", ncol(cols_keys), "\n")
+```
+
+### Stage 3: Drop interim quarterly fields
+
+The dataset is structured at the **annual level**, interim quarterly fields introduce duplication, misalignment, and missingness. Since fraud modeling should align with the reporting frequency used for `fraud_risk`, we remove interim Q1–Q4 variables unless explicitly modeling quarterly panels.
+
+```{r}
+# Stage 4: Drop interim quarterly statement fields
+cols_drop_stage4 <- colnames(lseg)[
+  str_detect(colnames(lseg), "^INTERIM ")
+]
+
+cat("Stage 3 complete\n")
+cat("Dropped interim columns:", length(cols_drop_stage4), "\n")
+cat("Columns selected for X-variables:", ncol(cols_keys), "\n")
+```
+
+### Stage 4: Drop reporting mechanics and structural metadata
+
+We remove fields that reflect reporting format, translation mechanics, incorporation dates, or administrative structure. These variables do not capture economic behavior and may introduce noise rather than signal in fraud modeling.
+
+```{r}
+# Stage 5: Drop reporting mechanics and structural metadata
+cols_drop_stage5 <- c(
+  "FORMAT CODE - CASH FLOW (18216)",
+  "EXCHANGE RATE USED FOR TRANSLATING BALANCE SHEET (18214)",
+  "EXHANGE RATE USED FOR TRANSLATING INC STATEMENT/CASH FL (18215)",
+  "CURRENT FISCAL YEAR END (5352)",
+  "DATE COMPANY FOUNDED (18272)",
+  "DATE OF INCORPORATION (18273)",
+  "ACCOUNTING METHOD FOR LONG TERM INVESTMENT >50% (7531)",
+  "ACCOUNTING STANDARDS FOLLOWED (7536)"
+)
+
+cat("Stage 4 complete\n")
+cat("Dropped reporting mechanics and structural metadata:", length(cols_drop_stage5), "\n")
+cat("Columns selected for X-variables:", ncol(cols_keys), "\n")
+```
+
+### Stage 5A: Income statement pressure/incentives (core performance & expense structure)
+
+```{r}
+cols_5A_is_core <- c(
+  "NET SALES OR REVENUES (1001)",
+  "COST OF GOODS SOLD (EXCL DEPRECIATION) (1051)",
+  "GROSS INCOME (1100)",
+  "SELLING, GENERAL & ADMINISTRATIVE EXPENSES (1101)",
+  "RESEARCH & DEVELOPMENT (1201)",
+  "OPERATING INCOME (1250)",
+  "INTEREST EXPENSE ON DEBT (1251)",
+  "PRETAX INCOME (1401)",
+  "INCOME TAXES (1451)",
+  "NET INCOME AVAILABLE TO COMMON (1751)",
+  "RETURN ON ASSETS (8326)"
+)
+
+
+cat("Stage 5A complete - IS core\n")
+cat(
+  "Columns selected for X-variables:",
+  sum(length(cols_keys), length(cols_5A_is_core)),
+  "\n"
+)
+```
+
+### Stage 5B: Working capital manipulation signals (receivables, inventories, payable, liquidity base)
+
+```{r}
+cols_5B_wc <- c(
+  "CASH & SHORT TERM INVESTMENTS (2001)",
+  "RECEIVABLES(NET) (2051)",
+  "INVENTORIES - TOTAL (2101)",
+  "OTHER CURRENT ASSETS (2149)",
+  "CURRENT ASSETS - TOTAL (2201)",
+  "ACCOUNTS PAYABLE (3040)",
+  "OTHER CURRENT LIABILITIES (3066)",
+  "LONG TERM RECEIVABLES (2258)",
+  "CURRENT LIABILITIES - TOTAL (3101)",
+  "PROPERTY, PLANT AND EQUIPMENT - NET (2501)",
+  "INCREASE/DECREASE IN WORKING CAPITAL (4900)"
+)
+
+cat("Stage 5B complete - Working capital\n")
+cat(
+  "Columns selected for X-variables:",
+  sum(length(cols_keys), length(cols_5A_is_core), length(cols_5B_wc)),
+  "\n"
+)
+```
+
+### Stage 5C: Leverage & Solvency (Covenant pressure/distress)
+
+```{r}
+
+cols_5C_leverage <- c(
+  "SHORT TERM DEBT & CURRENT PORTION OF LONG TERM DEBT (3051)",
+  "TOTAL DEBT (3255)",
+  "TOTAL LIABILITIES (3351)",
+  "COMMON EQUITY (3501)",
+  "LONG TERM DEBT (3251)",
+  "PREFERRED STOCK (3451)",
+  "LEASE COMMITMENTS YEAR 1 (18141)",
+  "TOTAL DEBT % COMMON EQUITY (8231)",
+  "TOTAL DEBT % TOTAL ASSETS (8236)"
+)
+summary(lseg$`TOTAL DEBT % COMMON EQUITY (8231)`)
+
+
+cat("Stage 5C complete - Leverage/solvency\n")
+cat(
+  "Columns selected for X-variables:",
+  sum(length(cols_keys), length(cols_5A_is_core), length(cols_5B_wc)
+      ,length(cols_5C_leverage)),
+  "\n"
+)
+```
+
+### Stage 5D: Cash flow reality checks (earnings vs cash)
+
+```{r}
+cols_5D_cashflow <- c(
+  "FUNDS FROM OPERATIONS (4201)",
+  "NET CASH FROM CONTINUING OPERATIONS (4891)",
+  "CHANGES IN CASH AND/OR LIQUID S (4452)",
+  "INCREASE/DECREASE IN CASH AND SHORT TERM INVESTMENTS (4851)",
+  "CAPITAL EXPENDITURES (ADDITIONS TO FIXED ASSETS) (4601)",
+  "SHORT TERM INVESTMENTS (2008)",
+  "DEPRECIATION, DEPLETION AND AMORTIZATION (4051)",
+  "EARNINGS BEFORE INTEREST AND TAXES (EBIT) (18191)"
+)
+
+
+cat("Stage 5D complete - Cash flow\n")
+cat(
+  "Columns selected for X-variables:",
+  sum(length(cols_keys), length(cols_5A_is_core), length(cols_5B_wc)
+      ,length(cols_5C_leverage), length(cols_5D_cashflow)),
+  "\n"
+)
+```
+
+### Stage 5E: Intangibles & Capitalization (aggressive capitalization/ impairment exposure)
+
+```{r}
+cols_5E_intangibles <- c(
+  "OTHER INTANGIBLES - NET (2513)",
+  "TOTAL INTANGIBLE OTHER ASSETS - NET (2649)",
+  "DEVELOPMENT COSTS - NET (2504)",
+  "COMPUTER SOFTWARE - NET (18299)",
+  "OTHER INVESTMENTS (2250)",
+  "INVESTMENTS IN ASSOCIATED COMPANIES (2256)",
+  "DEPRECIATION (1148)",
+  "RETAINED EARNINGS (3495)",
+  "MARKET CAPITALIZATION (U.S.$) (7210)"
+)
+
+
+cat("Stage 5E complete - Intangibles\n")
+cat(
+  "Columns selected for X-variables:",
+  sum(length(cols_keys), length(cols_5A_is_core), length(cols_5B_wc)
+      ,length(cols_5C_leverage), length(cols_5D_cashflow)
+      ,length(cols_5E_intangibles)),
+  "\n"
+)
+```
+
+There are 51 chosen variables
+
+```{r}
+# Put all the selected X-variables into a dataframe
+df_model <- lseg %>%
+  select(any_of(c(
+    cols_keys,
+    cols_5A_is_core,
+    cols_5B_wc,
+    cols_5C_leverage,
+    cols_5D_cashflow,
+    cols_5E_intangibles,
+    "COMPANY NAME (6001)",
+    "EMPLOYEES - 1 YR ANNUAL GROWTH (8626)",
+    "TOTAL ASSETS (2999)"
+  )))
+```
+
+```{r}
+# Retrieve all the selected columns names
+colnames(df_model)
+```
+
+## Data Cleaning and Pre-processing
+
+### Stage 0: Prepare our Y Variable (AAER)
+
+In constructing our dependent variable (**AAER**), we assigned each firm-year observation a binary indicator to signify the occurrence of an Accounting and Auditing Enforcement Release. Our matching process accounted for company name inconsistencies and the specific timing of enforcement actions to ensure data accuracy. We adopted a **5-year fraud window**, as recent literature suggests that a 3-5 year horizon is the critical period for detecting corporate financial fraud (Zhu et al., 2025).
+
+**Steps taken:**
+
+1.  AAER enforcement data were extracted as JSON records via an API call. The data contains information such as enforcement ID, date, and company entities. The python code of how the AAER were obtained from the SEC-API package is included for your viewing pleasure, but commented out.
+
+2.  Identify which AAER enforcement corresponds to which firm (`company_clean ~ name_clean`) using fuzzy matching
+
+3.  Define a **fraud window**: 5 years before the enforcement year.
+
+4.  Flag **all firm-year observations** that fall within this window as `AAER = 1`, even if the dataset doesn’t include the enforcement year itself.
+
+5.  All other firm-years = 0.
+
+**This ensures:**
+
+-   No true fraud is missed due to slight name mismatches.
+
+-   Past years of potential misconduct are captured.
+
+**Fuzzy matching** is also used to match company names that are not exactly identical but refer to the same entity (e.g., “Apple Inc” vs “Apple Incorporated”), which would be missed by exact joins. The `stringdist_left_join()` function enables this by matching names **based** **on similarity** rather than exact equality.
+
+-   We use the **Jaro-Winkler distance** `(method = "jw")`, which is suitable for short strings like company names because it gives more weight to matching prefixes.
+
+-   Setting `max_dist = 0.05` means we only accept matches that are extremely similar, allowing only minor differences such as abbreviations or suffixes. This can be interpreted as roughly \~95% similarity, though it is not an exact percentage.
+
+Importantly, there is no universal threshold for string matching. Threshold selection should be data-driven and validated through manual checking or sampling (Christen, 2012).
+
+```{python}
+## Python component to extract AAER from SEC API
+## Not to be ran unless a regeneration of all AAER Logs is required.
+  
+# %pip install sec-api
+# from sec_api import AaerApi
+# import json
+# 
+# aaerApi = AaerApi("### ADD IN YOUR OWN SEC-API KEY HERE ###")
+# all_aaers = []
+# search_from = 0
+# 
+# while True:
+#     query = {
+#         "query": "dateTime:[1997-01-01 TO 2025-12-31]", # Change accordingly
+#         "from": str(search_from),
+#         "size": "50",
+#         "sort": [{"dateTime": {"order": "desc"}}]
+#     }
+# 
+#     response = aaerApi.get_data(query)
+#     batch = response["data"]
+# 
+#     if len(batch) == 0:
+#         break
+# 
+#     all_aaers.extend(batch)
+#     search_from += 50
+#     print(f"Fetched {len(all_aaers)} AAERs so far...")
+# 
+# print(f"Total AAERs retrieved: {len(all_aaers)}")
+# 
+# with open('../data/aaer.json', 'w') as json_file:
+#     json.dump(all_aaers, json_file, indent=4)
+```
+
+```{r}
+# 1. Load data
+aaer_logs <- fromJSON("../data/aaer.json")
+
+# 2. Extract AAER company entities
+entities_df <- bind_rows(aaer_logs$entities, .id = "aaer_row") %>%
+  mutate(aaer_row = as.integer(aaer_row))
+
+meta <- aaer_logs %>%
+  mutate(aaer_row = row_number()) %>%
+  select(aaer_row, id, dateTime, aaerNo)
+
+aaer_companies <- entities_df %>%
+  filter(type == "company") %>%
+  inner_join(meta, by = "aaer_row") %>%
+  select(id, dateTime, aaerNo, name)
+
+# 3. Clean company names
+clean_name <- function(x) {
+  x <- tolower(x)
+  x <- gsub("[^a-z0-9 ]", "", x)
+  x <- gsub("\\b(inc|corp|ltd|plc|co|company|group|holdings?)\\b", "", x)
+  x <- gsub("\\s+", " ", x)
+  trimws(x)
+}
+
+df_model <- df_model %>%
+  mutate(company_clean = clean_name(`COMPANY NAME (6001)`),
+         fiscal_year = year(`FISCAL PERIOD END DATE (5350)`))
+
+aaer_companies <- aaer_companies %>%
+  mutate(name_clean = clean_name(name),
+         aaer_year = year(ymd_hms(dateTime)))
+
+# 4. Fuzzy join (company match)
+matches <- stringdist_left_join(
+  df_model,
+  aaer_companies,
+  by = c("company_clean" = "name_clean"),
+  method = "jw",
+  max_dist = 0.05,
+  distance_col = "dist"
+)
+
+# 5. Keep best match per firm-year
+matches <- matches %>%
+  group_by(code, fiscal_year) %>%
+  arrange(dist) %>%
+  dplyr::slice(1) %>%
+  ungroup()
+
+# 6. Label AAER using time window
+matches <- matches %>%
+  mutate(
+    AAER = if_else(
+      !is.na(aaer_year) &
+      fiscal_year >= (aaer_year - 5) &
+      fiscal_year <= aaer_year,
+      1, 0
+    )
+  )
+
+# 7. Clean up
+df_model_aaer <- matches %>%
+  select(-company_clean, -name_clean, -dist, -fiscal_year, -aaer_year, -id, -dateTime, -aaerNo, -name)
+```
+
+```{r}
+# Keep only the best match per company and clean names
+matches_for_review <- matches %>%
+  group_by(code) %>%                  
+  arrange(dist, .by_group = TRUE) %>% 
+  dplyr::slice(1) %>%                        
+  ungroup() %>%
+  mutate(
+    `LSEG company name` = clean_name(`COMPANY NAME (6001)`),
+    `AAER company name` = clean_name(name)
+  ) %>%
+  select(
+    `LSEG company name`, 
+    `AAER company name`, 
+    dist
+  )
+
+# Show only fuzzy matches (distance > 0)
+matches_for_review %>%
+  filter(dist > 0)
+```
+
+```{r}
+# Check class distribution
+table(df_model_aaer$AAER)
+```
+
+### Stage 1: Handle Missing Values
+
+#### **1.1 Drop Columns with \>90% NA Values**
+
+We find that there are some columns variables with close to 100% missing data (i.e. NA values). Such as the first four variables listed below.
+
+```{r}
+get_na_summary <- function(df, cols = NULL) {
+  if (is.null(cols)) cols <- names(df)
+  
+  df_subset <- if (inherits(df, "data.table")) df[, cols, with = FALSE] else df[, cols]
+  
+  tibble(
+    Column = names(df_subset),
+    NA_Count = sapply(df_subset, function(x) sum(is.na(x))),
+    Percentage = round(sapply(df_subset, function(x) mean(is.na(x)) * 100), 0)
+  ) %>%
+    arrange(desc(Percentage))
+}
+
+get_na_summary(df_model_aaer)
+```
+
+Since such columns are unlikely to be informative for model building, we decided to remove all columns where more than 90% of the data are missing.
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  select(
+    -`COMPANY STATUS (1000)`,
+    -`CHANGES IN CASH AND/OR LIQUID S (4452)`,
+    -`NET CASH FROM CONTINUING OPERATIONS (4891)`,
+    -`DEVELOPMENT COSTS - NET (2504)`
+  )
+```
+
+#### **1.2 Drop Rows where Date Column Contains NAs**
+
+We exclude observations with missing `FISCAL PERIOD END DATE (5350)` data because the AAER labeling relies on a time window. A firm may have a valid AAER match (`aaer_year` exists) but because `FISCAL PERIOD END DATE (5350)` is NA, AAER gets labeled as **0 instead of 1.** Hence, keeping them would incorrectly classify these firms as non-fraud, introducing label noise and biasing the model.
+
+```{r}
+# Count number of NAs
+sum(is.na(df_model_aaer$`FISCAL PERIOD END DATE (5350)`))
+```
+
+```{r}
+# Drop rows
+df_model_aaer <- df_model_aaer %>%
+  filter(!is.na(`FISCAL PERIOD END DATE (5350)`))
+
+# Count number of NAs
+sum(is.na(df_model_aaer$`FISCAL PERIOD END DATE (5350)`))
+```
+
+#### **1.3 Replacing NAs with Winsorised Mean**
+
+**1) For General Financial Variables**
+
+Variables like *Net Sales, Operating Income, Current Assets, Other Current Liabilities*, *Accounts Payable* and SG&A are core financial statement line items that should generally be reported by operating firms. Hence, a **11-25% missing rate** suggests these are not "true zeros". To address this, we will impute missing values using the **Winsorised mean**, calculated over the 5th to 95th percentiles **within each year** for a more accurate representation of the overall financial performance of the industry in that year. Moreover, literature suggests further splitting each yearly data by bins of **TOTAL_ASSETS** to achieve a more accurate Winsorised mean based on the **firm size** (Dang et al., 2018).
+
+This will allow us to preserve scale and limit distortion from outliers, especially since financial magnitudes vary over time due to macroeconomic conditions and firm growth.
+
+```{r}
+cols_to_impute <- c(
+  "NET SALES OR REVENUES (1001)",
+  "OPERATING INCOME (1250)",
+  "CURRENT ASSETS - TOTAL (2201)",
+  "OTHER CURRENT LIABILITIES (3066)",
+  "ACCOUNTS PAYABLE (3040)",
+  "SELLING, GENERAL & ADMINISTRATIVE EXPENSES (1101)",
+  "COST OF GOODS SOLD (EXCL DEPRECIATION) (1051)",
+  "GROSS INCOME (1100)",
+  "PRETAX INCOME (1401)",
+  "INCOME TAXES (1451)",
+  "NET INCOME AVAILABLE TO COMMON (1751)",
+  "CASH & SHORT TERM INVESTMENTS (2001)",
+  "SHORT TERM DEBT & CURRENT PORTION OF LONG TERM DEBT (3051)",
+  "TOTAL DEBT (3255)"
+)
+
+get_na_summary(df_model_aaer, cols_to_impute)
+```
+
+```{r}
+# STEP 1: Create FIRM_SIZE (10 groups per year)
+
+df_model_aaer <- df_model_aaer %>%
+  group_by(`FISCAL PERIOD END DATE (5350)`) %>%
+  mutate(
+    FIRM_SIZE = ceiling(percent_rank(log1p(`TOTAL ASSETS (2999)`)) * 10)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    FIRM_SIZE = if_else(FIRM_SIZE == 0, 1L, FIRM_SIZE)
+  )
+
+# STEP 2: Winsorised Imputation Function
+
+winsorised_impute <- function(df, cols, group_cols,
+                                    lower = 0.05, upper = 0.95) {
+  
+  # ---- Overall fallback ----
+  overall_vals <- lapply(cols, function(col) {
+    x <- df[[col]]
+    x_no_na <- x[!is.na(x)]
+    
+    if (length(x_no_na) == 0) return(NA_real_)
+    
+    q_low  <- quantile(x_no_na, lower, na.rm = TRUE)
+    q_high <- quantile(x_no_na, upper, na.rm = TRUE)
+    
+    x_wins <- pmin(pmax(x_no_na, q_low), q_high)
+    mean(x_wins, na.rm = TRUE)
+  })
+  names(overall_vals) <- cols
+  
+  # ---- Grouped imputation ----
+  df %>%
+    group_by(across(all_of(group_cols))) %>%
+    mutate(across(all_of(cols), ~{
+      
+      x <- .
+      x_no_na <- x[!is.na(x)]
+      
+      # If entire group is NA → fallback
+      if (length(x_no_na) == 0) {
+        return(rep(overall_vals[[cur_column()]], length(x)))
+      }
+      
+      q_low  <- quantile(x_no_na, lower, na.rm = TRUE)
+      q_high <- quantile(x_no_na, upper, na.rm = TRUE)
+      
+      x_wins <- pmin(pmax(x_no_na, q_low), q_high)
+      group_mean <- mean(x_wins, na.rm = TRUE)
+      
+      x[is.na(x)] <- group_mean
+      x
+    })) %>%
+    ungroup()
+}
+
+# STEP 3: Apply Imputation
+
+df_model_aaer <- winsorised_impute(
+  df = df_model_aaer,
+  cols = cols_to_impute,
+  group_cols = c("FISCAL PERIOD END DATE (5350)", "FIRM_SIZE")
+)
+
+# STEP 4: Final Checks
+
+# NA check
+get_na_summary(df_model_aaer, cols_to_impute)
+```
+
+```{r}
+df_model_aaer %>%
+  filter(
+    `FISCAL PERIOD END DATE (5350)` == "2021-12-31",
+    !is.na(FIRM_SIZE)
+  ) %>%
+  ggplot(aes(x = factor(FIRM_SIZE))) +
+  geom_bar(fill = "purple") +
+  labs(
+    title = "Firm Size Distribution (2021)",
+    x = "Firm Size Bin (1 = Smallest, 10 = Largest)",
+    y = "Number of Records"
+  )
+```
+
+**2) For R&D and Software Variables**
+
+Next, the **17–74% missing data** in our dataset for variables like *Development Costs, Computer Software, R&D* and *Other Intangibles* is unlikely to represent genuine “zeros”. In technology companies, R&D and software expenditures are almost always present. According to BCG, the average software company **spends about 20% of revenue on R&D**; some spend **more than 40%.** (Ahlawat et al., 2022)
+
+```{r}
+cols_to_impute <- c(
+  "COMPUTER SOFTWARE - NET (18299)",
+  "RESEARCH & DEVELOPMENT (1201)",
+  "OTHER INTANGIBLES - NET (2513)",
+  "TOTAL INTANGIBLE OTHER ASSETS - NET (2649)"
+)
+
+get_na_summary(df_model_aaer, cols_to_impute)
+```
+
+Hence, it more likely reflects data collection issues rather than structural absence of R&D or software activities. Hence, we will impute missing values using the **Winsorized mean** of by yearly data and by the firm size average to preserve typical expenditure levels across firms of different sizes.
+
+```{r}
+# Impute Winsorised Mean
+df_model_aaer <- winsorised_impute(
+  df = df_model_aaer,
+  cols = cols_to_impute,
+  group_cols = c("FISCAL PERIOD END DATE (5350)", "FIRM_SIZE")
+)
+
+# Quick NA check
+get_na_summary(df_model_aaer, cols_to_impute)
+```
+
+**3) Cashflow Variables**
+
+Treating missing cash flow as zero would understate a firm’s activity and introduce bias, since timing differences or data collection gaps can cause values to be missing. Therefore, missing cash flow values are imputed using the year and firm size-specific Winsorized mean, reflecting expected cash flow levels while limiting the influence of extreme observations.
+
+```{r}
+cols_to_impute <- c(
+  "FUNDS FROM OPERATIONS (4201)",
+  "INCREASE/DECREASE IN CASH AND SHORT TERM INVESTMENTS (4851)",
+  "CAPITAL EXPENDITURES (ADDITIONS TO FIXED ASSETS) (4601)"
+)
+
+get_na_summary(df_model_aaer, cols_to_impute)
+```
+
+```{r}
+# Impute Winsorised Mean
+df_model_aaer <- winsorised_impute(
+  df = df_model_aaer,
+  cols = cols_to_impute,
+  group_cols = c("FISCAL PERIOD END DATE (5350)", "FIRM_SIZE")
+)
+
+# Quick NA check
+get_na_summary(df_model_aaer, cols_to_impute)
+```
+
+### Stage 2: Create New X Variables
+
+#### **2.1 Variable Mutation & Handle Outliers**
+
+**1) Year**
+
+For easier referencing to the fiscal year, we'll create a 'year' variable as such.
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  mutate(
+    year = year(`FISCAL PERIOD END DATE (5350)`))
+```
+
+**2) Industry Difference (INDUSTRY_DIFF)**
+
+The **INDUSTRY_DIFF** measures the difference between a firm's revenue growth and the average revenue growth of the industry. Firms that manipulate their financial statements aggressively often report revenue growth that significantly exceeds industry trends (\>17%). This may be an indicator of aggressive revenue recognition. This X variable helps identify abnormal performance patterns that may signal potential manipulation (Brazel, Jones, & Lian, 2024).
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  # 1. Average revenue across all companies per year
+  group_by(year) %>%
+  mutate(industry_avg_revenue = mean(`NET SALES OR REVENUES (1001)`, na.rm = TRUE)) %>%
+  ungroup() %>%
+  
+  # 2. Annual industry growth per company
+  group_by(code) %>%
+  arrange(year, .by_group = TRUE) %>%
+  mutate(
+    INDUSTRY_GROWTH = (industry_avg_revenue - lag(industry_avg_revenue)) / lag(industry_avg_revenue),
+    
+    # 3. Revenue growth per company per annum
+    REVENUE_GROWTH = (`NET SALES OR REVENUES (1001)` - lag(`NET SALES OR REVENUES (1001)`)) / lag(`NET SALES OR REVENUES (1001)`),
+    
+    # 4. Make sure growth is finite
+    REVENUE_GROWTH = ifelse(is.finite(REVENUE_GROWTH), REVENUE_GROWTH, NA),
+    
+    # 5. Difference between company and industry
+    INDUSTRY_DIFF = REVENUE_GROWTH - INDUSTRY_GROWTH,
+    
+    # 6. Flag large differences
+    HIGH_INDUSTRY_DIFF = INDUSTRY_DIFF > 0.17
+  ) %>%
+  ungroup()
+
+# Inspect
+summary(df_model_aaer$INDUSTRY_DIFF)
+```
+
+Notice that the summary shows `Max = 3,435,866,351` for **INDUSTRY_DIFF**, while the 3rd quartile is `0`. This suggests a massive right tail where these extreme outliers can skew model estimates and inflate variance, reducing predictive stability.
+
+```{r}
+# Plot density
+ggplot(df_model_aaer, aes(x = INDUSTRY_DIFF)) +
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Density Plot of INDUSTRY_DIFF",
+       x = "INDUSTRY_DIFF",
+       y = "Density") +
+        geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +
+  theme_minimal()
+```
+
+Hence, we will winsorise the top 1% and bottom 1% of values to improve predictive stability and avoid models overreacting to rare, unrealistic revenue spikes.
+
+```{r}
+winsorise <- function(x, lower = 0.01, upper = 0.99) {
+  q_low  <- quantile(x, probs = lower, na.rm = TRUE)
+  q_high <- quantile(x, probs = upper, na.rm = TRUE)
+  pmin(pmax(x, q_low), q_high)
+}
+
+df_model_aaer <- df_model_aaer %>%
+  mutate(
+    INDUSTRY_DIFF = winsorise(INDUSTRY_DIFF)
+  )
+
+# Inspect
+summary(df_model_aaer$INDUSTRY_DIFF)
+```
+
+```{r}
+# Plot density
+ggplot(df_model_aaer, aes(x = INDUSTRY_DIFF)) +
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Density Plot of INDUSTRY_DIFF (After Winsorising)",
+       x = "INDUSTRY_DIFF",
+       y = "Density") +
+        geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +
+  theme_minimal()
+```
+
+**3) Revenue Difference (REVENUE_DIFF)**
+
+**REVENUE_DIFF** measures the change in a firm's revenue growth compared to its prior year. This ratio captures any sudden accelerations in revenue performance. By detecting abnormal changes, it can indicate revenue manipulation or earnings management (Brazel, Jones, & Lian, 2024).
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  group_by(code) %>%
+  mutate(REVENUE_DIFF = REVENUE_GROWTH - lag(REVENUE_GROWTH)) %>%
+  ungroup() 
+
+# Inspect
+summary(df_model_aaer$REVENUE_DIFF)
+```
+
+Notice that the summary shows `Max = 3,435,866,345` for **REVENUE_DIFF** while the 3rd quartile is `0`. The density plot below also suggests these extreme outliers towards the right.
+
+```{r}
+# Plot density
+ggplot(df_model_aaer, aes(x = REVENUE_DIFF)) +
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Density Plot of REVENUE_DIFF",
+       x = "REVENUE_DIFF",
+       y = "Density") +
+        geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +
+  theme_minimal()
+```
+
+Hence, we will winsorise the top 1% and bottom 1% of values accordingly to remove the extreme outliers. Interestingly, the density plot for REVENUE_DIFF exhibits multiple peaks both below and above the mean, suggesting that unusual spikes in revenue growth may reflect potential earnings manipulation, such as premature or inflated revenue recognition.
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  mutate(
+    REVENUE_DIFF = winsorise(REVENUE_DIFF)
+  )
+
+summary(df_model_aaer$REVENUE_DIFF)
+```
+
+```{r}
+ggplot(df_model_aaer, aes(x = REVENUE_DIFF)) +
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Density Plot of REVENUE_DIFF (After Winsorising)",
+       x = "REVENUE_DIFF",
+       y = "Density") +
+        geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +
+  theme_minimal()
+```
+
+**4) Employee Difference (EMPLOYEE_DIFF)**
+
+**EMPLOYEE_DIFF** calculates the difference in companies' revenue growth and employee growth. Usually, increase in revenue will lead to increase operational resources such as employment. However, when revenue growth is significantly higher than the number of employees, it may suggest that the reported revenue growth is not supported by operational expansion (Brazel, Jones, & Lian, 2024).
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  mutate(
+    EMPLOYEE_DIFF = REVENUE_GROWTH - `EMPLOYEES - 1 YR ANNUAL GROWTH (8626)`,
+    EMPLOYEE_DIFF = replace_na(EMPLOYEE_DIFF, 0)  # replace NA with 0
+  )
+
+# Inspect
+summary(df_model_aaer$EMPLOYEE_DIFF)
+```
+
+The density plot for **EMPLOYEE_DIFF** shows us a right-skewed graph, suggesting that some firms’ revenue grows much faster than their employee base, potentially signaling aggressive revenue recognition or manipulation.
+
+```{r}
+# Plot density
+ggplot(df_model_aaer, aes(x = EMPLOYEE_DIFF)) +
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Density Plot of EMPLOYEE_DIFF",
+       x = "EMPLOYEE_DIFF",
+       y = "Density") +
+        geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +
+  theme_minimal()
+```
+
+Notice that the summary shows `Min = -212174` for **EMPLOYEE_DIFF** while the 1st quartile is at 0. The density plot below also suggests these extreme outliers towards the left.
+
+Hence, we will winsorise the top 1% and bottom 1% of values accordingly to remove the extreme outliers.
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  mutate(
+    EMPLOYEE_DIFF = winsorise(EMPLOYEE_DIFF)
+  )
+
+summary(df_model_aaer$EMPLOYEE_DIFF)
+```
+
+```{r}
+ggplot(df_model_aaer, aes(x = EMPLOYEE_DIFF)) +
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Density Plot of EMPLOYEE_DIFF (After Winsorising)",
+       x = "EMPLOYEE_DIFF",
+       y = "Density") +
+        geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +
+  theme_minimal()
+```
+
+**5) Inventory Growth (INVENTORY_GROWTH)**
+
+Inventory Growth measures the changes in a firm's inventory over time. Firms engaging in accounts manipulation or fraud typically would also manipulate the inventory account, causing inventory to grow abnormally if revenue is inflated without real demand to support it. As such, unusual inventory growth serves as a red flag of potential accounting manipulation or fraud (Cokeley, 2018).
+
+To prevent `inf` INVENTORY_GROWTH, we apply the Berger and Ofek style scaling, taking the mean of the current year and lagged year's value, to handle missing/zero value data.
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  group_by(code) %>%
+  arrange(year, .by_group = TRUE) %>%
+  
+  # 1. Compute previous inventory and growth
+  mutate(
+    prev_inventory = lag(`INVENTORIES - TOTAL (2101)`),
+    INVENTORY_GROWTH = (`INVENTORIES - TOTAL (2101)` - prev_inventory) / 
+                       ((abs(`INVENTORIES - TOTAL (2101)`) + abs(prev_inventory)) / 2)
+  ) %>%
+  
+  # 2. Handle NAs: replace NA with 0 (safe for first year or missing inventory)
+  mutate(
+    INVENTORY_GROWTH = replace_na(INVENTORY_GROWTH, 0)
+  ) %>%
+  ungroup()
+
+# Inspect
+summary(df_model_aaer$INVENTORY_GROWTH)
+```
+
+**6) Receivables Growth (ACC_REC_GROWTH)**
+
+Receivables growth measures the growth in accounts receivable from the current year relative to the year prior. An abornormally high receivables growth may indicate high likelihood of accounts manipulation or fraud through aggressive revenue recognition policies or the fabrication sales (Cokeley, 2018). Similarly, to prevent `inf` values, we'll only compute ACC_REC_GROWTH if previous year's receivables is non-zero, else we assign it as NA.
+
+To prevent `inf` ACC_REC_GROWTH, we apply the Berger and Ofek style scaling, taking the mean of the current year and lagged year's value, to handle missing/zero value data.
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  group_by(code) %>%
+  arrange(year, .by_group = TRUE) %>%
+  mutate(
+    prev_receivable = lag(`RECEIVABLES(NET) (2051)`),
+    ACC_REC_GROWTH = (`RECEIVABLES(NET) (2051)` - prev_receivable) / 
+                     ((abs(`RECEIVABLES(NET) (2051)`) + abs(prev_receivable)) / 2)
+  ) %>%
+  ungroup()
+
+# Inspect
+summary(df_model_aaer$ACC_REC_GROWTH)
+```
+
+```{r}
+# Plot density     
+ggplot(df_model_aaer, aes(x = ACC_REC_GROWTH)) +
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Density Plot of ACC_REC_GROWTH",
+       x = "ACC_REC_GROWTH",
+       y = "Density") +
+        geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +
+  theme_minimal()
+```
+
+**7) Soft Assets / Total Assets Ratio (SOFT_ASSETS_RATIO)**
+
+This ratio measures the proportion of soft assets relative to a company's total assets. Soft assets such as intangible assets, prepaid expenses or goodwill are non-physical assets that are more difficult to verifiable or value, often relying on estimates for valuation. As such, there is a greater opportunity for firms to inflate their asset values. A high proportion of soft assets to total assets is a red flag for accounts manipulation as it suggests that a majority of a firm's assets is based on their own estimates, which can be easily inflated (Cokeley, 2018).
+
+Here, if `inf` is calculated, it means that **TOTAL ASSETS** is 0, which would be impossible. Hence, we will clean them to be `NA`.
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  mutate(
+    `TOTAL ASSETS (2999)` = na_if(`TOTAL ASSETS (2999)`, 0),
+    SOFT_ASSETS_RATIO = `OTHER INTANGIBLES - NET (2513)` / `TOTAL ASSETS (2999)`
+  )
+
+# Inspect
+summary(df_model_aaer$SOFT_ASSETS_RATIO)
+```
+
+There is a huge right-skew for the **SOFT_ASSETS_RATIO** variable noting that `Max = 89,950,000,000` while `Mean = 322,700`. These extreme values will dominate correlations and model estimates, making them unstable.
+
+```{r}
+# Plot density     
+ggplot(df_model_aaer, aes(x = SOFT_ASSETS_RATIO)) +
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Density Plot of SOFT_ASSETS_RATIO",
+       x = "SOFT_ASSETS_RATIO",
+       y = "Density") +
+        geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +
+  theme_minimal()
+```
+
+Hence, let's winsorise the top 1% and bottom 1% again to reduce the impact of outliers.
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  mutate(
+    SOFT_ASSETS_RATIO = winsorise(SOFT_ASSETS_RATIO)
+  )
+
+summary(df_model_aaer$SOFT_ASSETS_RATIO)
+```
+
+```{r}
+# Plot density     
+ggplot(df_model_aaer, aes(x = SOFT_ASSETS_RATIO)) +
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Density Plot of SOFT_ASSETS_RATIO (After Winsorising)",
+       x = "SOFT_ASSETS_RATIO",
+       y = "Density") +
+        geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +
+  theme_minimal()
+```
+
+**8) Accounts Receivable / Sales Ratio (REC_TO_SALES)**
+
+Revenue and receivables are common accounts that are manipulated when companies want to commit financial statement fraud. Increased revenue normally leads to an increase in receivables. Accounts receivable is commonly increased to mask fake income (Detection of Fraudulent Financial Reporting Using Ratio Analysis, n.d.).
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  mutate(
+    `NET SALES OR REVENUES (1001)` = na_if(`NET SALES OR REVENUES (1001)`, 0),
+    REC_TO_SALES = `RECEIVABLES(NET) (2051)` / `NET SALES OR REVENUES (1001)`
+  )
+
+# Inspect
+summary(df_model_aaer$REC_TO_SALES)
+```
+
+The density plot shows that most firms have low or zero **REC_TO_SALES**, while the long right tail indicates that a small number of firms have unusually high ratios. These extreme values likely reflect abnormally high receivables relative to revenue or very low revenue and can disproportionately influence correlations and model estimates.
+
+```{r}
+# Plot density     
+ggplot(df_model_aaer, aes(x = REC_TO_SALES)) +
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Density Plot of REC_TO_SALES",
+       x = "REC_TO_SALES",
+       y = "Density") +
+        geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +
+  theme_minimal()
+```
+
+Hence, let's winsorise the top 1% and bottom 1% to remove extreme outliers that may skew our analysis and correlation.
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  mutate(
+    REC_TO_SALES = winsorise(REC_TO_SALES)
+  )
+
+summary(df_model_aaer$REC_TO_SALES)
+```
+
+```{r}
+# Plot density     
+ggplot(df_model_aaer, aes(x = REC_TO_SALES)) +
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Density Plot of REC_TO_SALES (After Winsorising)",
+       x = "REC_TO_SALES",
+       y = "Density") +
+        geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +
+  theme_minimal()
+```
+
+**9) Lease Commitments (LEASE_COMM)**
+
+We have found the existence of an operating lease obligation to be a potential indicator of predicting whether a firm is misstating their financial statements. Operating leases permit firms to use assets such as buildings, machinery or vehicles without transferring ownership, and thus eliminating the need to record a debt on the balance sheet, particularly under older accounting standards. Misstating firms might take advantage of this to finance purchases of property, plant and equipment without recording a debt (Cokeley, 2018). We replaced all NAs with 0s since it's possible for some companies to have no lease commitments.
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  rename(LEASE_COMM = `LEASE COMMITMENTS YEAR 1 (18141)`) %>%
+  mutate(
+    # Replace NA with 0
+    LEASE_COMM = replace_na(LEASE_COMM, 0),
+  )
+
+# Inspect summary
+summary(df_model_aaer$LEASE_COMM)
+```
+
+```{r}
+# Plot density     
+ggplot(df_model_aaer, aes(x = LEASE_COMM)) +
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Density Plot of LEASE_COMM",
+       x = "LEASE_COMM",
+       y = "Density") +
+        geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +
+  theme_minimal()
+```
+
+**10)** **NULL_RSST_FLAG (RSST: Richardson, Sloan, Soliman and Tuna)**
+
+RSST is another important variable that works in a similar way to accruals, but looks at more than just the net income. It covers other area of the balance sheet outside of cash that companies can hide fraud and manipulation such as in non-current operating assets (as was performed in the Worldcom Scandal) and investments of the company. Therefore this would provide a broader overview of the entire financial statement and the possible places it can be manipulated outside of just cash.
+
+In this case, we created a flag for whether companies contain a RSST value or not, where 1 = NULL and 0 = Not NULL.
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  group_by(code) %>%
+  arrange(year, .by_group = TRUE) %>%
+  
+  # 1. Calculate WC, NCO, FIN
+  mutate(
+    WC = (`CURRENT ASSETS - TOTAL (2201)` - `CASH & SHORT TERM INVESTMENTS (2001)`) -
+         (`CURRENT LIABILITIES - TOTAL (3101)` - `SHORT TERM DEBT & CURRENT PORTION OF LONG TERM DEBT (3051)`),
+    
+    NCO = `TOTAL ASSETS (2999)` - `CURRENT ASSETS - TOTAL (2201)` -
+          (`INVESTMENTS IN ASSOCIATED COMPANIES (2256)` + `OTHER INVESTMENTS (2250)`) - 
+          (`TOTAL LIABILITIES (3351)` - `CURRENT LIABILITIES - TOTAL (3101)` - `LONG TERM DEBT (3251)`),
+    
+    FIN = (`SHORT TERM INVESTMENTS (2008)` + `INVESTMENTS IN ASSOCIATED COMPANIES (2256)` + `OTHER INVESTMENTS (2250)`) -
+          (`LONG TERM DEBT (3251)` + `SHORT TERM DEBT & CURRENT PORTION OF LONG TERM DEBT (3051)` + `PREFERRED STOCK (3451)`)
+  ) %>%
+  
+  # 2. Calculate changes and average assets
+  mutate(
+    delta_WC  = WC - lag(WC),
+    delta_NCO = NCO - lag(NCO),
+    delta_FIN = FIN - lag(FIN),
+    avg_assets = (`TOTAL ASSETS (2999)` + lag(`TOTAL ASSETS (2999)`)) / 2
+  ) %>%
+  
+  # 3. Calculate RSST
+  mutate(
+    RSST = (delta_WC + delta_NCO + delta_FIN) / avg_assets,
+    
+    # 4. Create NULL_RSST_FLAG
+    NULL_RSST_FLAG = if_else(is.na(RSST), 1, 0)
+  ) %>%
+  
+  ungroup()
+
+# Inspect
+summary(df_model_aaer$NULL_RSST_FLAG)
+```
+
+Given that there are extreme outliers in this, we would also winsorise the top and bottom 1% in order to keep the data more realistic for our analysis and modelling.
+
+```{r}
+ggplot(df_model_aaer, aes(x = RSST)) +
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Density Plot of RSST", x = "RSST", y = "Density") +   
+  geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +  
+  theme_minimal()
+```
+
+```{r}
+# WWinsorise RSST 
+df_model_aaer <- df_model_aaer %>%      
+  mutate(RSST = winsorise(RSST))    
+
+summary(df_model_aaer$RSST)
+```
+
+```{r}
+ggplot(df_model_aaer, aes(x = RSST)) +      
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Density Plot of RSST (After Winsorising)", x = "RSST", y = "Density") +   
+  geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +   
+  theme_minimal()
+```
+
+**11) Leverage Index (LEVI)**
+
+The leverage index (LEVI) is keeping track of a company's debt level relative to its assets. As a company's debt levels rise relative to assets, the management meets increased pressure to meet rules by the banks and financial institutions, which would motivate companies to commit fraud in order to continue receiving support from these institutions. LEVI has been found to be one of the most important factors when it comes to both M-score and F-score predictions as well, which adds additional credibility in using this as a variable in our model. (Sylwestrzak & Słomkowska, 2025)
+
+To prevent `inf` levi, we only divide by the lagged leverage; if the lagged value is zero or missing the result is set to NA.
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  group_by(code) %>%                            # group by company
+  arrange(year, .by_group = TRUE) %>%           # ensure lag works correctly
+  mutate(
+    CURRENT_LEVERAGE = `TOTAL DEBT (3255)` / `TOTAL ASSETS (2999)`,
+    LEVERAGE_LAG = lag(CURRENT_LEVERAGE, n = 1L),
+    levi = CURRENT_LEVERAGE / LEVERAGE_LAG
+  ) %>%
+  ungroup()
+
+# Inspect 
+summary(df_model_aaer$levi)
+```
+
+There are a few extreme outliers with the maximum and minimum value showing `inf` which are likely extreme outliers that would heavily skew our model and analysis.
+
+```{r}
+# Plot density      
+ggplot(df_model_aaer, aes(x = levi)) +   
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) +  
+  labs(title = "Density Plot of levi", x = "levi", y = "Density") +       
+  geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) + theme_minimal()
+```
+
+Hence we winsorise the top and bottom 1% in order to remove the extreme outliers.
+
+```{r}
+# WWinsorise levi 
+df_model_aaer <- df_model_aaer %>%      
+  mutate(levi = ifelse(is.finite(levi), levi, NA),               
+         levi = winsorise(levi))    
+
+summary(df_model_aaer$levi)
+```
+
+```{r}
+# Plot density      
+ggplot(df_model_aaer, aes(x = levi)) +   
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) + 
+  labs(title = "Density Plot of levi (After Winsorising)", x = "levi", y = "Density") + 
+  geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +   theme_minimal()
+```
+
+**12) Accruals**
+
+Accruals are another important variable in determining the chance of a company committing fraud. A company with high net income but low cash flow would be suspicious since cash flow is not easily manipulated, but net income can be given that it is an accrual accounting and thus can be manipulated in order to make the company seem more profitable than it actually is. The larger the gap between the net income and cash flow, the more the company is earning "paper money" without any actual cash flow, which may be a sign of income manipulation. This variable has also been found to be one of the most significant predictors in the M-score in terms of accurate predictions. (Sylwestrzak & Słomkowska, 2025)
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  mutate(
+    `TOTAL ASSETS (2999)` = na_if(`TOTAL ASSETS (2999)`, 0),
+    ACCRUALS = (`NET INCOME AVAILABLE TO COMMON (1751)` - `FUNDS FROM OPERATIONS (4201)`) / `TOTAL ASSETS (2999)`
+  )
+
+# Inspect
+summary(df_model_aaer$ACCRUALS)
+```
+
+We can see that there are some extreme outliers that are likely due to dividing by a NA or 0 value in our model, and these are not representative of the data and would affect both our model and analysis negatively.
+
+```{r}
+# Plot density      
+ggplot(df_model_aaer, aes(x = ACCRUALS)) +   
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) + 
+  labs(title = "Density Plot of ACCRUALS", x = "ACCRUALS", y = "Density") +
+  geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +   theme_minimal()
+```
+
+Therefore we remove the NA values as well as winsor the top and bottom 1% to remove such outliers.
+
+```{r}
+# WWinsorise ACCRUALS 
+df_model_aaer <- df_model_aaer %>%      
+  mutate(ACCRUALS = ifelse(is.finite(ACCRUALS), ACCRUALS, NA),               
+         ACCRUALS = winsorise(ACCRUALS))    
+
+summary(df_model_aaer$ACCRUALS)
+```
+
+```{r}
+ggplot(df_model_aaer, aes(x = ACCRUALS)) +   
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) + 
+  labs(title = "Density Plot of ACCRUALS (After Winsorising)", x = "ACCRUALS", y = "Density") +
+  geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +   theme_minimal()
+```
+
+**13) Modified M-Score (5-factor)**
+
+The M-score is an established indicator of financial manipulation, using various ratios and line items in a company's financial statements and weighting them to come up with a universal score that reflects the company's chance of financial manipulation. While the original 8-factor M-score is seen as the classic metric, it has been found that 3 of the 8 variables have been adding "noise" to the model and giving false positives, and therefore a 5-factor model has been created to streamline the model and make it more reliable and accurate.
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  # 1. Replace 0 with NA for key denominators
+  mutate(
+    `NET SALES OR REVENUES (1001)` = na_if(`NET SALES OR REVENUES (1001)`, 0),
+    `TOTAL ASSETS (2999)` = na_if(`TOTAL ASSETS (2999)`, 0)
+  ) %>%
+  
+  # 2. Arrange chronologically per company
+  arrange(code, year) %>%
+  group_by(code) %>%
+  
+  # 3. Calculate intermediate variables
+  mutate(
+    curr_rec_sales = `RECEIVABLES(NET) (2051)` / `NET SALES OR REVENUES (1001)`,
+    DSRI = curr_rec_sales / lag(curr_rec_sales),
+    
+    curr_gm = (`NET SALES OR REVENUES (1001)` - `COST OF GOODS SOLD (EXCL DEPRECIATION) (1051)`) / `NET SALES OR REVENUES (1001)`,
+    GMI = lag(curr_gm) / curr_gm,
+    
+    curr_aq = 1 - ((`CURRENT ASSETS - TOTAL (2201)` + `PROPERTY, PLANT AND EQUIPMENT - NET (2501)`) / `TOTAL ASSETS (2999)`),
+    AQI = lag(curr_aq) / curr_aq,
+    
+    SGI = `NET SALES OR REVENUES (1001)` / lag(`NET SALES OR REVENUES (1001)`),
+    
+    curr_dep_rate = `DEPRECIATION (1148)` / (`DEPRECIATION (1148)` + `PROPERTY, PLANT AND EQUIPMENT - NET (2501)`),
+    DEPI = lag(curr_dep_rate) / curr_dep_rate
+  ) %>%
+  
+  # 4. Replace infinite or NaN values with NA
+  mutate(
+    DSRI = ifelse(is.finite(DSRI), DSRI, NA_real_),
+    GMI  = ifelse(is.finite(GMI),  GMI,  NA_real_),
+    AQI  = ifelse(is.finite(AQI),  AQI,  NA_real_),
+    SGI  = ifelse(is.finite(SGI),  SGI,  NA_real_),
+    DEPI = ifelse(is.finite(DEPI), DEPI, NA_real_)
+  ) %>%
+  
+  # 5. Calculate M-score
+  mutate(
+    M_score = -6.065 + (0.823 * DSRI) + (0.906 * GMI) + (0.593 * AQI) +
+                       (0.717 * SGI) + (0.107 * DEPI)
+  ) %>%
+  
+  # 6. Clean up intermediate variables
+  select(-curr_rec_sales, -curr_gm, -curr_aq, -curr_dep_rate) %>%
+  ungroup()
+
+# Inspect
+summary(df_model_aaer$M_score)
+```
+
+Given that there are extreme outliers that would affect the reliability and accuracy of our analysis and modelling, we will also winsorise the M-score.
+
+```{r}
+ggplot(df_model_aaer, aes(x = M_score)) +   
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) + 
+  labs(title = "Density Plot of M-score", x = "M_score", y = "Density") +
+  geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +   theme_minimal()
+```
+
+```{r}
+# WWinsorise M_score 
+df_model_aaer <- df_model_aaer %>%      
+  mutate(M_score = ifelse(is.finite(M_score), M_score, NA),               
+          M_score = winsorise(M_score))    
+
+summary(df_model_aaer$M_score)
+```
+
+```{r}
+ggplot(df_model_aaer, aes(x = M_score)) +   
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) + 
+  labs(title = "Density Plot of M-score (After Winsorising)", x = "M_score", y = "Density") +
+  geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +   theme_minimal()
+```
+
+Given that the most accurate threshold for the 5-factor M-score is -2.22, we use that as our threshold to count the number of companies that are above this threshold and are therefore likely to be committing fraud. So our -2.22 threshold gives us a 24.57% split between high-risk and low risk, which is similar to our additional findings that further back up our data and proves that this threshold would be a suitable fit for our model to use as a threshold.
+
+```{r}
+table(ifelse(df_model_aaer$M_score > -2.22, 1, 0))
+```
+
+```{r}
+m_threshold <- quantile(df_model_aaer$M_score, probs = 0.80, na.rm = TRUE)
+print(m_threshold)
+```
+
+**14) Gross Profit / Total Assets (net_margin & margin_jump)**
+
+This ratio is used because the profit margins assess the profitability of the company. A high profit margin attracts investors to invest capital into a company. Due to this, management may be more likely to misstate their profits in order to increase the demand for share capital. Margin_jump captures sudden changes in profitability across reporting periods. An unusual large increase in profitability not supported by corresponding growth in sales or operational improvements can be a significant indicator for earnings manipulation (Dechow et al., 2011).
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  arrange(code, `FISCAL PERIOD END DATE (5350)`) %>%  # chronological order
+  group_by(code) %>%
+  mutate(
+    net_margin = `NET INCOME AVAILABLE TO COMMON (1751)` / `NET SALES OR REVENUES (1001)`,
+    margin_jump = net_margin - lag(net_margin, n = 1L)
+  ) %>%
+  ungroup()
+
+# Inspect
+summary(df_model_aaer$net_margin)
+```
+
+**15) CFO / Net_Income (Cash Quality)**
+
+Cash flows are generally harder to manipulate than accruals. This is because they are tied to actual cash transactions rather than accounting estimates. A widening and persistent gap between reported profit and operating cash flow is one of the most reliable early-warning signals. It could be an indicator of low earnings quality and potential earnings manipulation
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  mutate(
+    CFO = `NET INCOME AVAILABLE TO COMMON (1751)`+ `DEPRECIATION, DEPLETION AND AMORTIZATION (4051)`- `INCREASE/DECREASE IN WORKING CAPITAL (4900)`,
+    CFO_NI = `CFO`  / 
+             `NET INCOME AVAILABLE TO COMMON (1751)`
+  )
+
+df_model_aaer <- df_model_aaer %>%
+  mutate(
+    CFO_NI = ifelse(is.infinite(CFO_NI), NA, CFO_NI)
+  )
+
+# Inspect
+summary(df_model_aaer$CFO_NI)
+```
+
+**16) Altman's Z-Score**
+
+We incorporate the Modified Altman Z-score (Z″-score) (Altman et al., 2016) as a composite measure of financial health, capturing a firm’s liquidity, profitability, leverage, and solvency using accounting-based ratios. This adaptation is suitable for non-manufacturing firms, as it replaces market-based inputs with book-value measures. The Z″-score helps identify financially distressed firms, which are more likely to engage in earnings manipulation or fraudulent reporting (AAER) to conceal deteriorating performance.
+
+```{r}
+df_model_aaer <- df_model_aaer %>%
+  mutate(
+    X1 = (`CURRENT ASSETS - TOTAL (2201)` - `CURRENT LIABILITIES - TOTAL (3101)`) / `TOTAL ASSETS (2999)`,
+    X2 = `RETAINED EARNINGS (3495)` / `TOTAL ASSETS (2999)`,
+    X3 = `EARNINGS BEFORE INTEREST AND TAXES (EBIT) (18191)` / `TOTAL ASSETS (2999)`,
+    X4 = `COMMON EQUITY (3501)` / `TOTAL LIABILITIES (3351)`,
+    Z_score = 3.25+ (6.56 * X1) + (3.26 * X2) + (6.72 * X3) + (1.05 * X4)
+  )
+
+# Inspect
+summary(df_model_aaer$Z_score)
+```
+
+Winsorising the Z-score is necessary to cap extreme and infinite values, which likely arise from data anomalies or denominator issues, and would otherwise distort model estimation and interpretation.
+
+```{r}
+# WWinsorise Z_score 
+df_model_aaer <- df_model_aaer %>%      
+  mutate(Z_score = ifelse(is.finite(Z_score), Z_score, NA),               
+         Z_score = winsorise(Z_score))    
+
+summary(df_model_aaer$Z_score)
+```
+
+```{r}
+ggplot(df_model_aaer, aes(x = Z_score)) +   
+  geom_density(adjust = 0.5, fill = "skyblue", color = "black", alpha = 0.7) + 
+  labs(title = "Density Plot of Z-score (After Winsorising)", x = "Z_score", y = "Density") +
+  geom_vline(xintercept = 0.16, color = "purple", linetype = "dotted", size = 1) +   theme_minimal()
+```
+
+```{r}
+df_model_aaer %>%
+  summarise(
+    Safe_Zone = sum(Z_score >= 5.85, na.rm = TRUE),
+    Grey_Zone = sum(Z_score >= 4.35 & Z_score < 5.85, na.rm = TRUE),
+    Distress_Zone = sum(Z_score < 4.35, na.rm = TRUE)
+  )
+```
+
+**17) Other financial ratios (ROA, DEBT_TO_ASSETS, DEBT_TO_EQUITY)**
+
+These financial ratios show different ROA measures how efficient a firm is in using its assets to generate profit. However, abnormally high values may also indicate potential earnings manipulation through inflated income.
+
+Both the DEBT_TO_ASSETS and DEBT_TO_EQUITY ratios reflect the firm’s leverage and reliance on debt financing. High leverage ratios suggest that the firm faces pressure to meet debt covenants and maintain investor confidence, which may incentivise the firm to manipulate financial results to reflect a more favourable financial outlook. As such, these 3 ratios are useful indicators for detecting potential accounting manipulation.
+
+```{r}
+df_model_aaer <- df_model_aaer %>% rename(ROA = `RETURN ON ASSETS (8326)`,
+                                          DEBT_TO_ASSETS = `TOTAL DEBT % TOTAL ASSETS (8236)`,
+                                          DEBT_TO_EQUITY = `TOTAL DEBT % COMMON EQUITY (8231)`
+)
+
+# Inspect
+summary(df_model_aaer$ROA)
+summary(df_model_aaer$DEBT_TO_ASSETS)
+summary(df_model_aaer$DEBT_TO_EQUITY)
+```
+
+#### **2.2 Drop Lagged Variables with NA**
+
+Once again, we have to clean the NA values found in these lagged variables (i.e. changes in financial ratios) since we do not have data from the previous year for calculation in the first year which leads to NAs.
+
+```{r}
+# Columns to check for NA
+check_cols <- c(
+  "INDUSTRY_DIFF",
+  "REVENUE_DIFF",
+  "ACC_REC_GROWTH",
+  "SOFT_ASSETS_RATIO",
+  "REC_TO_SALES",
+  "levi",
+  "ACCRUALS",
+  "net_margin",
+  "margin_jump",
+  "CFO_NI",
+  "ROA",
+  "DEBT_TO_ASSETS",
+  "DEBT_TO_EQUITY",
+  "LEASE_COMM",
+  "NULL_RSST_FLAG",
+  "EMPLOYEE_DIFF",
+  "M_score",
+  "Z_score",
+  "INVENTORY_GROWTH",
+  "FIRM_SIZE",
+  "AAER", "year", "code", "COMPANY NAME (6001)"
+)
+
+# Select only the columns in check_cols
+df_model_clean <- df_model_aaer %>%
+  select(all_of(check_cols)) %>%
+  arrange(code, year)
+
+# Check for NAs
+get_na_summary(df_model_clean)
+```
+
+In this case, we dropped such rows because simply replacing it with a 0 or an average would distort the data.
+
+```{r}
+df_model_final <- df_model_clean %>% 
+  drop_na()
+
+# Check for NAs
+get_na_summary(df_model_final)
+```
+
+### Stage 3: Natural Logarithmic Transformation
+
+Next, we check for variables with **long right tails** (positive skew). These companies have extremely high values compared to most others. Currently, our dataset includes both small listed tech companies and extremely large firms. Thus, log transformation normalises firm size effects so that coefficients will reflect economic relationships rather than size.
+
+-   Skewness \> 1 (strong positive) → consider log transform
+
+-   Skewness \< -1 (strong negative) → may consider log(x_max - x) transform
+
+-   Skewness between -1 and 1 → usually okay without transformation
+
+```{r}
+setDT(df_model_final)
+
+# Select numeric columns but ignore AAER
+num_cols <- setdiff(names(df_model_final)[sapply(df_model_final, is.numeric)], "AAER")
+
+# Compute skewness
+skew_summary <- data.table(
+  Column = num_cols,
+  Skewness = sapply(df_model_final[, ..num_cols], function(x) skewness(x, na.rm = TRUE))
+)
+
+# Sort by absolute skewness descending
+skew_summary <- skew_summary[order(-abs(Skewness))]
+skew_summary  
+```
+
+From the results above, almost all numeric variable showed skewness of \>1 which suggests high skewness. Monetary level variables were log-transformed using ln(x+1) to reduce extreme positive skewness and mitigate the influence of large firms. Binary and profit variables were left in levels to preserve interpretability and avoid distortions from negative values.
+
+```{r}
+# Select columns with absolute skewness > 1
+log_vars <- intersect(skew_summary$Column[abs(skew_summary$Skewness) > 1], names(df_model_final))
+
+# Apply signed log transformation
+df_model_final <- df_model_final %>%
+  mutate(across(all_of(log_vars), ~ {
+    x <- .
+    x[is.infinite(x)] <- NA          # replace Inf/-Inf with NA
+    if (any(x < 0, na.rm = TRUE)) {
+      sign(x) * log(abs(x) + 1)      # signed log for negatives
+    } else {
+      log(x + 1)                     # normal log for non-negatives
+    }
+  }))
+```
+
+```{r}
+setDT(df_model_final)
+
+# Select numeric columns but ignore AAER
+num_cols <- setdiff(names(df_model_final)[sapply(df_model_final, is.numeric)], "AAER")
+
+# Compute skewness
+skew_summary <- data.table(
+  Column = num_cols,
+  Skewness = sapply(df_model_final[, ..num_cols], function(x) skewness(x, na.rm = TRUE))
+)
+
+# Sort by absolute skewness descending
+skew_summary <- skew_summary[order(-abs(Skewness))]
+skew_summary
+```
+
+### Stage 4: Handle Class Imbalance
+
+Currently, the AAER class exhibits a ratio of approximately **410:1,** indicating a highly imbalanced dataset with far fewer AAER = 1 observations than AAER = 0 observations. Such imbalance can bias models toward the majority class and reduce the detection of rare fraud cases (Cheah et al., 2023; Wen et al., 2024).
+
+A **standard random undersampling** of the **majority class** would reduce this imbalance, but it could also create a comparison sample that is not well matched to the minority class. For example, it might draw too many non-AAER firms from years or firm-size groups that are not representative of the AAER firms.
+
+```{r}
+# Total Number of Rows Left
+df_model_final %>%
+  group_by(AAER) %>%
+  summarise(row_count = n())
+```
+
+To improve comparability, the majority class is **undersampled** **within each fiscal year and firm-size bin** rather than across the full dataset. This means the sampled non-AAER firms are drawn from the same time period and size category as the AAER firms.
+
+Within each group, the number of non-fraud firms sampled follows a **capped 5:1 ratio** relative to fraud firms, with a minimum of 5 observations. This ensures that each group remains sufficiently represented, even when there are very few fraud cases. For example, if a group contains 2 fraud firms, up to 10 non-fraud firms are sampled. If there is only 1 fraud firm, at least 5 non-fraud firms are retained.
+
+If no non-fraud firms exist in a group, the group is kept as is and flagged as sparse, **preserving the original data structure** without introducing artificial observations.
+
+```{r}
+set.seed(123)
+
+# Keep all minority-class observations
+minority_df <- df_model_final %>%
+  filter(AAER == 1)
+
+# Count minority observations within each stratum
+minority_strata <- minority_df %>%
+  count(year, FIRM_SIZE, name = "minority_n")
+
+# Count available majority observations within each stratum
+majority_strata <- df_model_final %>%
+  filter(AAER == 0) %>%
+  count(year, FIRM_SIZE, name = "majority_avail")
+
+# Build stratum-level sampling plan
+strata_info <- minority_strata %>%
+  left_join(majority_strata, by = c("year", "FIRM_SIZE")) %>%
+  mutate(
+    majority_avail  = coalesce(majority_avail, 0L),
+    target_majority = pmax(5L, minority_n * 5L),
+    sample_majority = pmin(majority_avail, target_majority),
+    sparse_stratum  = majority_avail == 0
+  )
+
+# Sample majority-class observations within each stratum
+majority_df <- df_model_final %>%
+  filter(AAER == 0) %>%
+  inner_join(
+    strata_info %>% select(year, FIRM_SIZE, sample_majority),
+    by = c("year", "FIRM_SIZE")
+  ) %>%
+  group_by(year, FIRM_SIZE) %>%
+  mutate(rand = runif(n())) %>%
+  arrange(rand, .by_group = TRUE) %>%
+  filter(row_number() <= dplyr::first(sample_majority)) %>%
+  ungroup() %>%
+  select(-rand, -sample_majority) #helper columns
+
+# Combine minority and sampled majority observations
+df_model_balanced <- bind_rows(minority_df, majority_df)
+
+# Check final class distribution
+table(df_model_balanced$AAER)
+```
+
+### Stage 5: Inspect Final Dataframe
+
+```{r}
+summary(df_model_balanced)
+```
+
+```{r}
+sapply(df_model_balanced, class)
+```
+
+```{r}
+# Save data
+write.csv(df_model_balanced, "../data/LSEG_modelling_ready_dataset.csv")
+```
+
+## Exploratory Data Analysis
+
+\[**Correlation Matrix of all Numeric X Variables against AAER**\]
+
+Looking specifically at the **AAER** column, the variable with the strongest association with fraud is **LEASE_COMM (0.46)**, suggesting that unusual lease commitments may be an important signal of fraudulent reporting in software firms. Other variables showing some relationship with AAER include **NULL_RSST_FLAG (0.09)**, **DEBT_TO_ASSETS (0.09)**, and **SOFT_ASSETS_RATIO (0.08)** on the positive side, while **Z_score (-0.13)**, **ACCRUALS (-0.11)**, **ROA (-0.11)**, and **REC_TO_SALES (-0.09)** show negative associations.
+
+This suggests that AAER firms may be characterized by weaker financial health, lower profitability, and balance sheet structures such as higher reliance on soft (intangible) assets and leverage, alongside potential data quality or reporting inconsistencies.
+
+```{r}
+# Select only the relevant columns from df_model_final
+vars_to_corr <- c(
+  "INDUSTRY_DIFF",
+  "REVENUE_DIFF",
+  "ACC_REC_GROWTH",
+  "SOFT_ASSETS_RATIO",
+  "REC_TO_SALES",
+  "levi",
+  "ACCRUALS",
+  "net_margin",
+  "margin_jump",
+  "CFO_NI",
+  "ROA",
+  "DEBT_TO_ASSETS",
+  "DEBT_TO_EQUITY",
+  "LEASE_COMM",
+  "NULL_RSST_FLAG",
+  "EMPLOYEE_DIFF",
+  "M_score",
+  "Z_score",
+  "INVENTORY_GROWTH",
+  "FIRM_SIZE",
+  "AAER"
+)
+
+df_corr <- df_model_balanced %>%
+  select(all_of(vars_to_corr))
+
+# Ensure only numeric columns
+df_corr <- df_corr %>%
+  mutate(AAER = as.numeric(AAER))
+
+# Compute correlation matrix
+corr_matrix <- cor(df_corr, use = "pairwise.complete.obs")
+
+# Plot using corrplot with smaller numbers
+corrplot(corr_matrix, method = "color", 
+         type = "upper",
+         addCoef.col = "black",
+         number.cex = 0.6, 
+         tl.cex = 0.7, 
+         tl.col = "black", tl.srt = 45,
+         diag = FALSE) 
+```
+
+\[**Distribution of AAER Records**\]
+
+As mentioned, our final dataset contains 541 fraud records (AAER = 1) and 2705 non-fraud records (AAER = 0).
+
+```{r}
+ggplot(df_model_balanced, aes(x = factor(AAER))) +
+  geom_bar(fill = "steelblue") +
+  geom_text(stat = "count", aes(label = after_stat(count)), 
+            vjust = -0.5, size = 4) +  
+  labs(title = "Count of AAER vs Non-AAER Records", x = "AAER", y = "Count")
+```
+
+\[**Distribution of Companies Who Committed Financial Fraud**\]
+
+Unlike the 5:1 ratio of AAER records, the number of unique companies who did not commit fraud are 16x more than the number of companies who committed fraud. This is partly driven by the construction of the AAER variable, where a fraud event is extended to the prior five years, increasing the number of AAER observations per firm without increasing the number of unique fraudulent companies. As a result, the imbalance appears less severe at the observation level but remains pronounced at the firm level.
+
+```{r}
+# Group by company (Code) and check if they ever had AAER = 1
+company_fraud <- df_model_balanced %>%
+  group_by(code) %>%
+  summarise(
+    had_fraud = max(AAER, na.rm = TRUE),  
+    years_of_data = n(), 
+    fraud_years = sum(AAER == 1, na.rm = TRUE)  
+  ) %>%
+  ungroup()
+
+# Create the bar plot showing companies with/without fraud
+ggplot(company_fraud, aes(x = factor(had_fraud))) +
+  geom_bar(fill = "steelblue") +
+  geom_text(stat = "count", aes(label = after_stat(count)), 
+            vjust = -0.5, size = 4) +  
+  labs(
+    title = "Count of Companies with AAER = 1 vs 0",
+    subtitle = "Company is classified as involved with fraud if AAER=1 in any year",
+    x = "",
+    y = "Number of Companies"
+  ) +
+  scale_x_discrete(labels = c("0" = "No Fraud (0)", "1" = "Had Fraud (1)"))
+```
+
+\[**AAER Time Trends**\]
+
+The number of fraud cases gradually increased from 2017 to a peak in 2019, before declining steadily from 2020 to 2024. The post-2019 decline may reflect changes in regulatory scrutiny or firm behavior following heightened enforcement activity. Additionally, the lower number of cases in more recent years (e.g., 2022–2024) may be driven by reporting lag, as enforcement actions for these periods are not yet fully observed.
+
+```{r}
+df_model_balanced %>%
+  filter(AAER == 1, !is.na(year)) %>%               # Only AAER = 1
+  group_by(Year = as.integer(year)) %>%            # Group by year
+  summarise(AAER_count = n(), .groups = "drop") %>%  # Count per year
+  arrange(Year) %>%
+  ggplot(aes(x = Year, y = AAER_count)) +
+  geom_line(color = "darkred") +
+  geom_point(color = "darkred") +
+  scale_x_continuous(breaks = seq(min(df_model_balanced$year, na.rm = TRUE),
+                                  max(df_model_balanced$year, na.rm = TRUE), by = 1)) +
+  labs(title = "Distrbution of AAER = 1 Count by Year",
+       x = "Year",
+       y = "Number of AAER Cases") 
+```
+
+\[**Density Plot of Lease Commitment by AAER**\]
+
+Non-fraud firms (AAER = 0) are heavily concentrated near zero, indicating relatively low or stable lease obligations. In contrast, fraud firms (AAER = 1) exhibit a distinct distribution with a peak at higher LEASE_COMM values (around 15–20), suggesting significantly larger or more unusual lease commitments.
+
+```{r}
+df_model_balanced %>%
+  filter(!is.na(LEASE_COMM), !is.na(AAER)) %>%
+  ggplot(aes(x = LEASE_COMM, fill = factor(AAER))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(
+    values = c("0" = "deepskyblue2", "1" = "red"),
+    labels = c("0" = "AAER = 0", "1" = "AAER = 1")
+  ) +
+  labs(
+    title = "Density Plot of Lease Commitment by AAER",
+    x = "LEASE_COMM",
+    y = "Density",
+    fill = "AAER"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+summary(df_model_balanced$LEASE_COMM)
+```
+
+\[**Density Plot of Z-Score by AAER**\]
+
+Fraud and non-fraud firms are concentrated around the gray and safe zones of the Z-score, indicating generally healthy financial conditions across the sample. However, fraud firms (AAER = 1) exhibit relatively greater density in the lower and negative Z-score regions, suggesting weaker financial health and higher distress. This leftward shift in the graph indicates that financially distressed firms may have stronger incentives to engage in fraudulent reporting.
+
+**a) Using log-transformed Z-score**
+
+Since we log-transformed the Z-score, we also log transformed the Altman thresholds consistently, ensuring that the distress, grey, and safe zones remain comparable on the transformed scale.
+
+```{r}
+log_4_35 <- log(4.35 + 1)
+log_5_85 <- log(5.85 + 1)
+
+df_model_balanced %>%
+  filter(!is.na(Z_score), !is.na(AAER)) %>%
+  ggplot(aes(x = Z_score, fill = factor(AAER))) +
+  geom_density(alpha = 0.5) +
+  
+  # Transformed thresholds
+  geom_vline(xintercept = log_4_35, linetype = "dashed", color = "darkgray") +
+  geom_vline(xintercept = log_5_85, linetype = "dashed", color = "darkgray") +
+  
+  # Labels (adjusted positions)
+  annotate("text", x = 0.7, y = 1, label = "Distress", size = 3) +
+  annotate("text", x = 1.8, y = 1, label = "Grey", size = 3) +
+  annotate("text", x = 2.8, y = 1, label = "Safe", size = 3) +
+  
+  scale_fill_manual(
+    values = c("0" = "deepskyblue2", "1" = "red"),
+    labels = c("AAER = 0", "AAER = 1")
+  ) +
+  labs(
+    title = "Density Plot of Z-score by AAER (Log Scale)",
+    x = "Z-score (log-transformed)",
+    y = "Density",
+    fill = "AAER"
+  ) +
+  theme_minimal() +
+  coord_cartesian(xlim = c(-6, NA))
+```
+
+**b) Using log-transformed Z-score**
+
+Similarly, using the raw Z-scores in the original sacle suggests similar results as seen in the leftward shift in the distribution of fraud firms.
+
+```{r}
+df_model_clean %>%
+  filter(!is.na(Z_score), !is.na(AAER)) %>%
+  ggplot(aes(x = Z_score, fill = factor(AAER))) +
+  geom_density(alpha = 0.5) +
+  
+  # Altman thresholds (RAW scale)
+  geom_vline(xintercept = 4.35, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 5.85, linetype = "dashed", color = "black") +
+  
+  # Labels for zones
+  annotate("text", x = 2.5, y = 0.8, label = "Distress", size = 3) +
+  annotate("text", x = 5.1, y = 0.8, label = "Grey", size = 3) +
+  annotate("text", x = 7, y = 0.8, label = "Safe", size = 3) +
+  
+  scale_fill_manual(
+    values = c("0" = "deepskyblue2", "1" = "red"),
+    labels = c("AAER = 0", "AAER = 1")
+  ) +
+  labs(
+    title = "Density Plot of Z-score by AAER",
+    x = "Z-score (Raw)",
+    y = "Density",
+    fill = "AAER"
+  ) +
+  coord_cartesian(xlim = c(-6, 15)) +
+  theme_minimal()
+```
+
+\[**Density Plot of ROA by AAER**\]
+
+The density curves for fraud and non-fraud firms largely overlap across both positive and negative ROA values, indicating that both groups exhibit similar profitability patterns. However, fraud firms show slightly higher concentration at negative ROA (around -2.5), while non-fraud firms exhibit higher density at positive ROA (around 2).
+
+This suggests that while profitability alone does not clearly distinguish fraud from non-fraud firms due to the substantial overlap, firms with poorer performance (negative ROA) may face greater pressure to manipulate earnings, whereas non-fraud firms tend to cluster more around stable positive profitability.
+
+```{r}
+df_model_balanced %>%
+  filter(!is.na(ROA), !is.na(AAER)) %>%
+  ggplot(aes(x = ROA, fill = factor(AAER))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(
+    values = c("0" = "deepskyblue2", "1" = "red"),
+    labels = c("0" = "AAER = 0", "1" = "AAER = 1")
+  ) +
+  labs(
+    title = "Density Plot of ROA by AAER",
+    x = "ROA",
+    y = "Density",
+    fill = "AAER"
+  ) +
+  theme_minimal()
+```
+
+\[**Density Plot of Accruals by AAER**\]
+
+The density plot shows that both fraud and non-fraud firms are concentrated around small accrual values near zero, indicating similar baseline accounting practices. However, fraud firms (AAER = 1) exhibit a wider spread and greater presence in the negative accrual region, suggesting more extreme or unusual accrual behavior. This may reflect earnings manipulation through the use of accruals to distort reported performance.
+
+```{r}
+df_model_balanced %>%
+  filter(!is.na(ACCRUALS), !is.na(AAER)) %>%
+  ggplot(aes(x = ACCRUALS, fill = factor(AAER))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(
+    values = c("0" = "deepskyblue2", "1" = "red"),
+    labels = c("0" = "AAER = 0", "1" = "AAER = 1")
+  ) +
+  labs(
+    title = "Density Plot of ACCRUALS by AAER",
+    x = "ACCRUALS",
+    y = "Density",
+    fill = "AAER"
+  ) +
+  theme_minimal()
+```
+
+\[**Density Plot of Margin Jump by AAER**\]
+
+Both fraud and non-fraud firms are highly concentrated around zero margin changes, indicating that most firms experience relatively stable profit margins year-on-year. Fraud firms (AAER = 1) exhibit slightly greater dispersion, particularly in the tails, suggesting more instances of unusually large positive or negative changes in profitability. Such extreme margin movements may reflect earnings manipulation, either through inflating performance or masking declines.
+
+```{r}
+df_model_balanced %>%
+  filter(!is.na(margin_jump), !is.na(AAER)) %>%
+  mutate(
+    lower = quantile(margin_jump, 0.025, na.rm = TRUE),
+    upper = quantile(margin_jump, 0.975, na.rm = TRUE),
+    margin_jump_w = pmin(pmax(margin_jump, lower), upper)
+  ) %>%
+  ggplot(aes(x = margin_jump_w, fill = factor(AAER))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(
+    values = c("0" = "deepskyblue2", "1" = "red"),
+    labels = c("AAER = 0", "AAER = 1")
+  ) +
+  labs(
+    title = "Density Plot of Margin Jump by AAER (Winsorised 2.5%)",
+    x = "Margin Jump (Winsorised)",
+    y = "Density",
+    fill = "AAER"
+  ) +
+  theme_minimal()
+```
+
+\[**Density Plot of Receivable to Sales by AAER**\]
+
+The density plot shows that both fraud and non-fraud firms are concentrated at low levels of receivables relative to sales, indicating similar baseline working capital structures. Fraud firms (AAER = 1) exhibit slightly higher density at very low REC_TO_SALES values than non-fraud firms but with visible spikes at higher values, which may suggest aggressive revenue recognition. Nonetheless, both groups display a long right tail, suggesting dispersion in receivables intensity. The substantial overlap between the two distributions indicates that REC_TO_SALES alone does not clearly distinguish fraudulent firms.
+
+```{r}
+df_model_balanced %>%
+  filter(!is.na(REC_TO_SALES), !is.na(AAER)) %>%
+  ggplot(aes(x = REC_TO_SALES, fill = factor(AAER))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(
+    values = c("0" = "deepskyblue2", "1" = "red"),
+    labels = c("0" = "AAER = 0", "1" = "AAER = 1")
+  ) +
+  labs(
+    title = "Density Plot of REC_TO_SALES by AAER",
+    x = "REC_TO_SALES",
+    y = "Density",
+    fill = "AAER"
+  ) +
+  theme_minimal()
+```
+
+\[**Density Plot of Debt to Equiy by AAER**\]
+
+The density plot shows that both fraud and non-fraud firms are concentrated around moderate positive debt-to-equity levels (around 3–5), indicating similar leverage structures for most firms. However, fraud firms (AAER = 1) exhibit relatively higher density in the negative debt-to-equity region, which may reflect firms with **negative equity** or **financial distress.** This suggests that highly distressed capital structures could be associated with increased fraud risk. Nevertheless, the overlap between the two distributions indicates that leverage alone is not a strong standalone indicator of fraud.
+
+```{r}
+df_model_balanced %>%
+  filter(!is.na(DEBT_TO_EQUITY), !is.na(AAER)) %>%
+  ggplot(aes(x = DEBT_TO_EQUITY, fill = factor(AAER))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(
+    values = c("0" = "deepskyblue2", "1" = "red"),
+    labels = c("0" = "AAER = 0", "1" = "AAER = 1")
+  ) +
+  labs(
+    title = "Density Plot of DEBT_TO_EQUITY by AAER",
+    x = "DEBT_TO_EQUITY",
+    y = "Density",
+    fill = "AAER"
+  ) +
+  theme_minimal()
+```
+
+## Data Modelling Setup
+
+```{r load-data}
+dt <- copy(df_model_balanced)
+dt[, .N, AAER]
+
+set.seed(42)
+```
+
+## Feature Selection and Data Cleaning
+
+This step prepares the dataset for model training by defining AAER as the target variable and selecting relevant predictors while removing identifiers and non-informative columns using setdiff().
+
+A modeling dataset is created with only the selected features and target. Observations with missing values are removed, and any infinite values are converted to NA and subsequently dropped.
+
+The final dataset is fully cleaned and suitable for machine learning, with a summary of total observations and fraud cases reported for validation.
+
+```{r feature-selection}
+target <- "AAER"
+
+#setdiff function is to remove unwanted columns for training
+features <- setdiff(
+  names(dt),
+  c("id", "V1", "code", "year", "COMPANY NAME (6001)", target)
+)
+
+# Keep only complete cases
+model_dt <- dt[, .SD, .SDcols = c(features, target)]
+model_dt <- model_dt[complete.cases(model_dt)]
+
+# Replace Inf / -Inf with NA then drop
+model_dt[,
+  (features) := lapply(.SD, function(x) ifelse(is.infinite(x), NA, x)),
+  .SDcols = features
+]
+model_dt <- model_dt[complete.cases(model_dt)]
+
+cat(sprintf(
+  "Final modelling dataset: %d rows, %d fraud cases (%.1f%%)\n",
+  nrow(model_dt),
+  sum(model_dt$AAER),
+  100 * mean(model_dt$AAER)
+))
+```
+
+## Stratified Train / Test Split (80/20)
+
+This step first performs a stratified 80/20 split so that the fraud proportion is preserved in both the training and test sets.
+
+```{r train-test-split}
+model_df <- as.data.frame(model_dt)
+model_df$AAER <- as.factor(model_df$AAER)
+levels(model_df$AAER) <- c("NonFraud", "Fraud")
+
+train_idx <- createDataPartition(model_df$AAER, p = 0.8, list = FALSE)
+train_raw <- model_df[train_idx, ]
+test <- model_df[-train_idx, ]
+
+cat(sprintf("Train: %d rows | Test: %d rows\n", nrow(train_raw), nrow(test)))
+cat(sprintf(
+  "Train fraud rate: %.1f%% | Test fraud rate: %.1f%%\n",
+  100 * mean(train_raw$AAER == "Fraud"),
+  100 * mean(test$AAER == "Fraud")
+))
+```
+
+## Sampling Strategy Comparison
+
+This section evaluates three sampling strategies: standard, oversampling (ROSE), and undersampling, to address class imbalance in fraud detection. Logistic Regression is used as a benchmark model, and performance is assessed on a held-out test set to determine which approach generalises best .
+
+### Produce Training Sets
+
+Three versions of the training dataset are created:
+
+-   Standard: original data without modification
+-   Oversampling (ROSE): generates synthetic fraud observations to balance classes
+-   Undersampling: reduces non-fraud observations to match the number of fraud cases
+
+The size and fraud proportion of each dataset are reported to show how class balance changes.
+
+```{r sampling-sets}
+# Standard (no resampling)
+train_standard <- train_raw
+
+# Oversampling — ROSE synthesises new minority observations
+train_over <- ROSE(AAER ~ ., data = train_raw, seed = 42)$data
+
+# Undersampling — randomly drop majority class down to fraud count
+n_fraud <- sum(train_raw$AAER == "Fraud")
+maj_idx <- which(train_raw$AAER == "NonFraud")
+keep_maj <- sample(maj_idx, size = n_fraud, replace = FALSE)
+train_under <- train_raw[c(which(train_raw$AAER == "Fraud"), keep_maj), ]
+
+cat("\n===== SAMPLING STRATEGY SUMMARY =====\n")
+cat(sprintf("  Standard  : %d rows | Fraud: %.1f%%\n",
+            nrow(train_standard), 100 * mean(train_standard$AAER == "Fraud")))
+cat(sprintf("  Oversample: %d rows | Fraud: %.1f%%\n",
+            nrow(train_over), 100 * mean(train_over$AAER == "Fraud")))
+cat(sprintf("  Undersample:%d rows | Fraud: %.1f%%\n",
+            nrow(train_under), 100 * mean(train_under$AAER == "Fraud")))
+```
+
+### Run Comparison
+
+Each training dataset is used to train a Logistic Regression model with 5-fold cross-validation. The trained model is then evaluated on the same held-out test set. Performance metrics include: - AUC-ROC - PR-AUC - F1-score - Precision and Recall
+
+This ensures a fair comparison of how each sampling strategy performs on real, unseen data.
+
+```{r sampling-comparison}
+ctrl_compare <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+compare_sampling <- function(train_df, label, X_test, y_test) {
+  X_tr <- train_df[, features]
+  y_tr <- factor(train_df$AAER, levels = c("NonFraud", "Fraud"))
+
+  fit <- train(
+    x = X_tr,
+    y = y_tr,
+    method = "glm",
+    family = "binomial",
+    metric = "ROC",
+    trControl = ctrl_compare
+  )
+
+  probs <- predict(fit, newdata = X_test, type = "prob")[, "Fraud"]
+  preds <- predict(fit, newdata = X_test)
+
+  roc_obj <- roc(y_test, probs, levels = c("NonFraud", "Fraud"), quiet = TRUE)
+  auc_roc <- as.numeric(auc(roc_obj))
+
+  pr_obj <- pr.curve(
+    scores.class0 = probs[y_test == "Fraud"],
+    scores.class1 = probs[y_test == "NonFraud"],
+    curve = TRUE
+  )
+  auc_pr <- pr_obj$auc.integral
+
+  cm <- confusionMatrix(preds, y_test, positive = "Fraud")
+  precision <- cm$byClass["Precision"]
+  recall <- cm$byClass["Recall"]
+  f1 <- cm$byClass["F1"]
+
+  cat(sprintf("\n  [%s]\n", label))
+  cat(sprintf("    AUC-ROC : %.4f\n", auc_roc))
+  cat(sprintf("    PR-AUC  : %.4f\n", auc_pr))
+  cat(sprintf("    F1      : %.4f\n", f1))
+  cat(sprintf("    Precision: %.4f | Recall: %.4f\n", precision, recall))
+
+  list(
+    label = label, auc_roc = auc_roc, auc_pr = auc_pr,
+    f1 = f1, precision = precision, recall = recall,
+    roc_obj = roc_obj, pr_obj = pr_obj
+  )
+}
+
+X_test_cmp <- test[, features]
+y_test_cmp <- test$AAER
+
+cat("\n--- Sampling Comparison (Logistic Regression on held-out test set) ---\n")
+samp_results <- list(
+  standard = compare_sampling(train_standard, "Standard (no resampling)", X_test_cmp, y_test_cmp),
+  over     = compare_sampling(train_over,     "Oversampling (ROSE)",      X_test_cmp, y_test_cmp),
+  under    = compare_sampling(train_under,    "Undersampling",            X_test_cmp, y_test_cmp)
+)
+```
+
+### Comparison Table
+
+The results from all sampling strategies are combined into a summary table showing key metrics. This allows for direct comparison of model performance across different sampling approaches.
+
+```{r sampling-table}
+samp_tbl <- rbindlist(lapply(samp_results, function(r) {
+  data.table(
+    Strategy  = r$label,
+    AUC_ROC   = round(r$auc_roc, 4),
+    PR_AUC    = round(r$auc_pr, 4),
+    F1        = round(r$f1, 4),
+    Precision = round(r$precision, 4),
+    Recall    = round(r$recall, 4)
+  )
+}))
+print(samp_tbl)
+```
+
+### Comparison Plots
+
+```{r sampling-roc, fig.width=8, fig.height=5}
+plot(samp_results$standard$roc_obj, col = "#377EB8", lwd = 2,
+     main = "Sampling Strategy Comparison — ROC Curves (LR)")
+plot(samp_results$over$roc_obj,  col = "#4DAF4A", lwd = 2, add = TRUE)
+plot(samp_results$under$roc_obj, col = "#E41A1C", lwd = 2, add = TRUE)
+legend("bottomright",
+       legend = c(
+         sprintf("Standard    (%.3f)", samp_results$standard$auc_roc),
+         sprintf("Oversample  (%.3f)", samp_results$over$auc_roc),
+         sprintf("Undersample (%.3f)", samp_results$under$auc_roc)
+       ),
+       col = c("#377EB8", "#4DAF4A", "#E41A1C"), lwd = 2)
+```
+
+```{r sampling-pr, fig.width=8, fig.height=5}
+plot(samp_results$standard$pr_obj, col = "#377EB8", lwd = 2,
+     main = "Sampling Strategy Comparison — PR Curves (LR)", auc.main = FALSE)
+plot(samp_results$over$pr_obj,  col = "#4DAF4A", lwd = 2, add = TRUE, auc.main = FALSE)
+plot(samp_results$under$pr_obj, col = "#E41A1C", lwd = 2, add = TRUE, auc.main = FALSE)
+legend("topright",
+       legend = c(
+         sprintf("Standard    (%.3f)", samp_results$standard$auc_pr),
+         sprintf("Oversample  (%.3f)", samp_results$over$auc_pr),
+         sprintf("Undersample (%.3f)", samp_results$under$auc_pr)
+       ),
+       col = c("#377EB8", "#4DAF4A", "#E41A1C"), lwd = 2)
+```
+
+```{r sampling-bar, fig.width=8, fig.height=5}
+samp_plot_df <- melt(samp_tbl, id.vars = "Strategy",
+                     measure.vars = c("AUC_ROC", "PR_AUC", "F1"),
+                     variable.name = "Metric", value.name = "Score")
+ggplot(samp_plot_df, aes(x = Strategy, y = Score, fill = Metric)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.7), width = 0.6) +
+  
+  scale_fill_manual(values = c(
+    "AUC_ROC" = "#1F3A5F",   
+    "PR_AUC"  = "#4F8A8B",   
+    "F1"      = "#FFE600"    
+  )) +
+  labs(
+    title = "Sampling Strategy Comparison (Logistic Regression)",
+    x = NULL,
+    y = "Score",
+    fill = "Metric"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+```
+
+### Select Winner
+
+The best sampling strategy is selected using the ranking rule:
+
+Score = PR-AUC + 0.5 × F1
+
+PR-AUC is prioritised because fraud detection is an imbalanced problem, and PR-AUC better reflects performance on the minority class. F1 is included to balance precision and recall.
+
+Based on this rule: Oversampling (ROSE) achieved the highest score It provides the best overall balance between detecting fraud (recall) and maintaining precision
+
+Therefore, ROSE is selected as the final sampling strategy, and the model will be trained on this dataset going forward.
+
+```{r sampling-winner}
+samp_tbl[, rank_score := PR_AUC + 0.5 * F1]
+winner_label <- samp_tbl[
+  which.max(rank_score), Strategy
+]
+cat(sprintf("\n>> Winning sampling strategy: %s <<\n", winner_label))
+
+#train_best <- train_standard
+train_best <- switch(winner_label,
+  "Standard (no resampling)" = train_standard,
+  "Oversampling (ROSE)"       = train_over,
+  "Undersampling"             = train_under,
+  train_over   # fallback
+)
+
+cat(sprintf(
+  "   Main pipeline will train on %d rows (Fraud: %.1f%%)\n",
+  nrow(train_best),
+  100 * mean(train_best$AAER == "Fraud")
+))
+```
+
+## Model Training
+
+This section trains all candidate models using the selected sampling strategy from the earlier comparison. The same training and test variables are used throughout, and all models share the same 5-fold cross-validation settings so that model performance can be compared fairly. The factor levels are ordered as NonFraud and Fraud to ensure that fraud is treated as the positive class in evaluation.
+
+```{r training-setup}
+X_train <- train_best[, features]
+y_train <- factor(train_best$AAER, levels = c("NonFraud", "Fraud"))
+X_test  <- test[, features]
+y_test  <- factor(test$AAER, levels = c("NonFraud", "Fraud"))
+
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+```
+
+### Logistic Regression
+
+This section trains all candidate models using the selected sampling strategy from the earlier comparison. The same training and test variables are used throughout, and all models share the same 5-fold cross-validation settings so that model performance can be compared fairly. The factor levels are ordered as NonFraud and Fraud to ensure that fraud is treated as the positive class in evaluation.
+
+```{r train-lr}
+fit_lr <- train(
+  x = X_train,
+  y = y_train,
+  method = "glm",
+  family = "binomial",
+  metric = "ROC",
+  trControl = ctrl
+)
+cat("\nTraining Logistic Regression completed\n")
+```
+
+### LASSO
+
+This code trains a LASSO Logistic Regression model using glmnet. LASSO applies an L1 penalty that shrinks less important coefficients toward zero, which helps reduce overfitting and perform automatic feature selection. The tuning parameter lambda is selected by cross-validation, and the retained predictors are reported.
+
+```{r train-lasso}
+
+lasso_grid <- expand.grid(
+  alpha  = 1,
+  lambda = 10^seq(-4, 0, length.out = 50)
+)
+fit_lasso <- train(
+  x = as.matrix(X_train),
+  y = y_train,
+  method = "glmnet",
+  family = "binomial",
+  metric = "ROC",
+  trControl = ctrl,
+  tuneGrid = lasso_grid
+)
+cat(sprintf("  Best lambda: %.6f\n", fit_lasso$bestTune$lambda))
+
+lasso_coef <- coef(fit_lasso$finalModel, s = fit_lasso$bestTune$lambda)
+lasso_retained <- rownames(lasso_coef)[which(abs(lasso_coef) > 0)]
+cat(sprintf(
+  "  Features retained by LASSO: %s\n",
+  paste(lasso_retained[lasso_retained != "(Intercept)"], collapse = ", ")
+))
+cat("Training LASSO completed\n")
+```
+
+### Decision Tree (Pruned)
+
+This code trains a Decision Tree model and tunes the complexity parameter (cp) to obtain a pruned tree. Pruning reduces unnecessary splits and helps improve performance on unseen data by limiting overfitting.
+
+```{r train-dt}
+
+fit_dt <- train(
+  x = X_train,
+  y = y_train,
+  method = "rpart",
+  metric = "ROC",
+  trControl = ctrl,
+  tuneLength = 15
+)
+cat(sprintf("  Best cp: %.5f\n", fit_dt$bestTune$cp))
+cat("Training Pruned Decision completed\n")
+```
+
+### Random Forest
+
+This code trains a Random Forest model using 500 decision trees (ntree = 500) and tunes the mtry parameter (number of variables randomly sampled at each split) across 5 candidate values (tuneLength = 5). The ensemble approach reduces overfitting compared to a single decision tree by averaging predictions across many trees trained on bootstrapped samples.
+
+```{r train-rf}
+fit_rf <- train(
+  x = X_train,
+  y = y_train,
+  method = "rf",
+  metric = "ROC",
+  trControl = ctrl,
+  tuneLength = 5,
+  ntree = 500
+)
+
+cat("Training Random Forest completed\n")
+```
+
+### XGBoost
+
+This code trains an XGBoost model by performing an exhaustive grid search over 7 hyperparameters: number of boosting rounds (nrounds), tree depth (max_depth), learning rate (eta), minimum loss reduction for a split (gamma), fraction of features sampled per tree (colsample_bytree), minimum child node weight (min_child_weight), and row subsampling ratio (subsample). Each combination is evaluated using ROC-AUC, and the best-performing configuration is printed via bestTune. This tuning process helps balance model complexity and generalisation performance.
+
+```{r}
+# Parameter adjustment
+xgb_grid <- expand.grid(
+  nrounds          = c(100, 200),
+  max_depth        = c(3, 6),
+  eta              = c(0.05, 0.1),
+  gamma            = c(0, 0.1),
+  colsample_bytree = c(0.7, 0.8),
+  min_child_weight = c(1, 3),
+  subsample        = c(0.7, 0.8)
+)
+
+fit_xgb <- train(
+  x = X_train,
+  y = y_train,
+  method = "xgbTree",
+  metric = "ROC",
+  trControl = ctrl,
+  tuneGrid = xgb_grid,
+  verbose = 0,
+  verbosity = 0 # Removes all the generated warning messages
+)
+
+print(fit_xgb$bestTune)
+cat("Training XGBoost completed\n")
+```
+
+## Evaluation
+
+### Evaluation Function
+
+```{r eval-function}
+# use_matrix = TRUE for LASSO (glmnet requires matrix input for predict)
+evaluate_model <- function(model, X_test, y_test, model_name, use_matrix = FALSE) {
+  X_input <- if (use_matrix) as.matrix(X_test) else X_test
+
+  probs <- predict(model, newdata = X_input, type = "prob")[, "Fraud"]
+  preds <- predict(model, newdata = X_input)
+
+  roc_obj <- roc(y_test, probs, levels = c("NonFraud", "Fraud"), quiet = TRUE)
+  auc_roc <- as.numeric(auc(roc_obj))
+
+  pr_obj <- pr.curve(
+    scores.class0 = probs[y_test == "Fraud"],
+    scores.class1 = probs[y_test == "NonFraud"],
+    curve = TRUE
+  )
+  auc_pr <- pr_obj$auc.integral
+
+  cm        <- confusionMatrix(preds, y_test, positive = "Fraud")
+  precision <- cm$byClass["Precision"]
+  recall    <- cm$byClass["Recall"]
+  f1        <- cm$byClass["F1"]
+
+  cat(sprintf("\n--- %s ---\n", model_name))
+  cat(sprintf("  AUC-ROC : %.4f\n", auc_roc))
+  cat(sprintf("  PR-AUC  : %.4f\n", auc_pr))
+  cat(sprintf("  F1      : %.4f\n", f1))
+  cat(sprintf("  Precision: %.4f | Recall: %.4f\n", precision, recall))
+
+  list(
+    model_name = model_name,
+    auc_roc = auc_roc, auc_pr = auc_pr, f1 = f1,
+    precision = precision, recall = recall,
+    probs = probs, preds = preds,
+    roc_obj = roc_obj, pr_obj = pr_obj
+  )
+}
+```
+
+### Run Evaluation
+
+```{r run-evaluation}
+results_train <- list(
+  LR    = evaluate_model(fit_lr,    X_train, y_train, "Logistic Regression"),
+  LASSO = evaluate_model(fit_lasso, X_train, y_train, "LASSO", use_matrix = TRUE),
+  DT    = evaluate_model(fit_dt,    X_train, y_train, "Decision Tree (Pruned)"),
+  RF    = evaluate_model(fit_rf,    X_train, y_train, "Random Forest"),
+  XGB   = evaluate_model(fit_xgb,   X_train, y_train, "XGBoost")
+)
+
+results <- list(
+  LR    = evaluate_model(fit_lr,    X_test, y_test, "Logistic Regression"),
+  LASSO = evaluate_model(fit_lasso, X_test, y_test, "LASSO", use_matrix = TRUE),
+  DT    = evaluate_model(fit_dt,    X_test, y_test, "Decision Tree (Pruned)"),
+  RF    = evaluate_model(fit_rf,    X_test, y_test, "Random Forest"),
+  XGB   = evaluate_model(fit_xgb,   X_test, y_test, "XGBoost")
+)
+```
+
+### Summary Tables
+
+```{r summary-tables}
+summary_tbl_train <- rbindlist(lapply(results_train, function(r) {
+  data.table(
+    Model     = r$model_name,
+    AUC_ROC   = round(r$auc_roc, 4),
+    PR_AUC    = round(r$auc_pr, 4),
+    F1        = round(r$f1, 4),
+    Precision = round(r$precision, 4),
+    Recall    = round(r$recall, 4)
+  )
+}))
+
+summary_tbl <- rbindlist(lapply(results, function(r) {
+  data.table(
+    Model     = r$model_name,
+    AUC_ROC   = round(r$auc_roc, 4),
+    PR_AUC    = round(r$auc_pr, 4),
+    F1        = round(r$f1, 4),
+    Precision = round(r$precision, 4),
+    Recall    = round(r$recall, 4)
+  )
+}))
+
+cat("\n===== TRAIN SET PERFORMANCE =====\n")
+print(summary_tbl_train)
+cat("\n===== TEST SET PERFORMANCE =====\n")
+print(summary_tbl)
+```
+
+Across the test set, all models exhibit very similar performance, with only marginal differences observed across AUC, PR-AUC, F1-score, precision, and recall. This indicates that no single model provides a clear overall predictive advantage, and the models can be considered broadly comparable in their ability to distinguish between fraudulent and non-fraudulent firms. Notably, more complex models such as Decision Tree, Random Forest, and XGBoost show near-perfect performance on the training set but substantially lower performance on the test set, suggesting the presence of overfitting, where the models capture noise rather than generalisable patterns.
+
+Given the objective of predicting fraud (AAER = 1), recall is prioritised as the primary evaluation metric, as it directly reflects the model’s ability to correctly identify fraudulent firms. In this context, false negatives are significantly more costly than false positives, since failing to detect a fraudulent firm poses greater risk than incorrectly flagging a non-fraudulent one. Therefore, model selection is guided by maximising recall while ensuring that other metrics, particularly precision and F1-score, remain at acceptable levels.
+
+Among the models, LASSO demonstrates the most balanced and robust performance, achieving one of the highest recall scores on the test set while maintaining comparable AUC and F1-score to other models. In contrast, although tree-based models such as Random Forest and XGBoost achieve slightly higher AUC values, their recall does not consistently outperform LASSO, and their susceptibility to overfitting reduces confidence in their generalisability. As such, LASSO is preferred as the final model due to its strong recall performance, stability across training and test sets, and greater interpretability, making it more suitable for fraud detection in an imbalanced setting.
+
+## Results & Plots
+
+This showcases the plot based on the evaluation metrics \## ROC Curves
+
+```{r plot-roc, fig.width=8, fig.height=6}
+plot_colors <- c(LR = "#E41A1C", LASSO = "#984EA3", DT = "#377EB8",
+                 RF = "#4DAF4A", XGB = "#FF7F00")
+
+plot(results$LR$roc_obj,    col = plot_colors["LR"],    lwd = 2, main = "ROC Curves")
+plot(results$LASSO$roc_obj, col = plot_colors["LASSO"], lwd = 2, add = TRUE)
+plot(results$DT$roc_obj,    col = plot_colors["DT"],    lwd = 2, add = TRUE)
+plot(results$RF$roc_obj,    col = plot_colors["RF"],    lwd = 2, add = TRUE)
+plot(results$XGB$roc_obj,   col = plot_colors["XGB"],   lwd = 2, add = TRUE)
+legend("bottomright",
+       legend = c(
+         sprintf("LR    (%.3f)", results$LR$auc_roc),
+         sprintf("LASSO (%.3f)", results$LASSO$auc_roc),
+         sprintf("DT    (%.3f)", results$DT$auc_roc),
+         sprintf("RF    (%.3f)", results$RF$auc_roc),
+         sprintf("XGB   (%.3f)", results$XGB$auc_roc)
+       ),
+       col = plot_colors, lwd = 2)
+```
+
+### Precision-Recall Curves
+
+```{r plot-pr, fig.width=8, fig.height=6}
+plot(results$LR$pr_obj,    col = plot_colors["LR"],    lwd = 2,
+     main = "Precision-Recall Curves", auc.main = FALSE)
+plot(results$LASSO$pr_obj, col = plot_colors["LASSO"], lwd = 2, add = TRUE, auc.main = FALSE)
+plot(results$DT$pr_obj,    col = plot_colors["DT"],    lwd = 2, add = TRUE, auc.main = FALSE)
+plot(results$RF$pr_obj,    col = plot_colors["RF"],    lwd = 2, add = TRUE, auc.main = FALSE)
+plot(results$XGB$pr_obj,   col = plot_colors["XGB"],   lwd = 2, add = TRUE, auc.main = FALSE)
+legend("topright",
+       legend = c(
+         sprintf("LR    (%.3f)", results$LR$auc_pr),
+         sprintf("LASSO (%.3f)", results$LASSO$auc_pr),
+         sprintf("DT    (%.3f)", results$DT$auc_pr),
+         sprintf("RF    (%.3f)", results$RF$auc_pr),
+         sprintf("XGB   (%.3f)", results$XGB$auc_pr)
+       ),
+       col = plot_colors, lwd = 2)
+```
+
+### Model Performance Bar Chart
+
+```{r plot-bar, fig.width=9, fig.height=5}
+plot_df <- melt(summary_tbl, id.vars = "Model",
+                measure.vars = c("AUC_ROC", "PR_AUC", "F1"),
+                variable.name = "Metric", value.name = "Score")
+
+ggplot(plot_df, aes(x = Model, y = Score, fill = Metric)) +
+  geom_bar(
+    stat = "identity",
+    position = position_dodge(width = 0.7),
+    width = 0.6
+  ) +
+  
+  scale_fill_manual(values = c(
+    "AUC_ROC" = "#1F3A5F",   # navy
+    "PR_AUC"  = "#4F8A8B",   # teal
+    "F1"      = "#FFE600"    # yellow
+  )) +
+  
+  labs(
+    title = "Model Performance Comparison (Test Set)",
+    x = NULL,
+    y = "Score",
+    fill = "Metric"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+```
+
+### Logistic Regression Summary
+
+```{r lr-summary}
+summary(fit_lr$finalModel)
+```
+
+The logistic regression results are evaluated using a significance threshold of p \< 0.05, with several variables identified as statistically significant contributors to fraud (AAER = 1). These include SOFT_ASSETS_RATIO, REC_TO_SALES, ACCRUALS, ROA, DEBT_TO_EQUITY, LEASE_COMM, NULL_RSST_FLAG, Z_score, and INVENTORY_GROWTH. The direction of the coefficients provides insight into their relationship with fraud risk. Variables such as SOFT_ASSETS_RATIO, LEASE_COMM, and NULL_RSST_FLAG have positive coefficients, indicating that higher values are associated with an increased likelihood of fraud. In particular, LEASE_COMM remains highly significant with a large positive coefficient, reinforcing its importance as a key driver of fraudulent behaviour. Conversely, variables such as REC_TO_SALES, ACCRUALS, ROA, DEBT_TO_EQUITY, Z_score, and INVENTORY_GROWTH have negative coefficients, suggesting that stronger financial health, better earnings quality, and more stable operations are associated with a lower likelihood of fraud.
+
+In terms of magnitude, the coefficient for LEASE_COMM (β = 0.1366) indicates that for every one-unit increase in the transformed LEASE_COMM variable, the log-odds of a firm being classified as fraudulent increase by 0.1366, holding other variables constant. In odds terms, this corresponds to an approximate 14.6% increase in the odds of fraud (e\^0.1366 0.1366 ≈ 1.146), highlighting the strong impact of lease commitments on fraud risk. Overall, these findings are consistent with prior model results, where indicators related to financial stability, earnings quality, and operational irregularities play a crucial role in distinguishing fraudulent firms. While some variables such as INDUSTRY_DIFF, REVENUE_DIFF, and CFO_NI are marginally significant (p \< 0.1), others do not show strong statistical evidence in this specification, with LEASE_COMM and REC_TO_SALES standing out as particularly influential variables.
+
+Conversely, variables such as ACC_REC_GROWTH, SOFT_ASSETS_RATIO, ACCRUALS, CFO_NI, DEBT_TO_ASSETS, M_score, INVENTORY_GROWTH, and FIRM_SIZE are not statistically significant at the 5% level, implying limited explanatory power within this model. Overall, the presence of multiple significant predictors suggests that the model captures meaningful relationships associated with fraudulent reporting. However, statistical significance alone does not determine overall model quality, and it should be interpreted alongside performance metrics such as AUC, recall, and F1-score when assessing the model’s effectiveness.
+
+### LASSO
+
+#### Lambda Selection (CV ROC vs Lambda)
+
+```{r lasso-lambda, fig.width=8, fig.height=5}
+plot(fit_lasso)
+```
+
+#### Coefficient Path
+
+```{r lasso-coef-path, fig.width=8, fig.height=5}
+plot(fit_lasso$finalModel, xvar = "lambda", label = TRUE)
+abline(v = log(fit_lasso$bestTune$lambda), col = "red", lty = 2)
+legend("topright",
+       legend = sprintf("Best lambda = %.5f", fit_lasso$bestTune$lambda),
+       col = "red", lty = 2)
+```
+
+#### Retained Coefficients at Best Lambda
+
+```{r lasso-coefs}
+coef(fit_lasso$finalModel, s = fit_lasso$bestTune$lambda)
+```
+
+The LASSO model performs variable selection by shrinking less important coefficients to zero, resulting in a more parsimonious set of predictors. In this model, variables such as levi, net_margin, and margin_jump are shrunk to zero, indicating that they do not contribute significantly to the prediction of fraud (AAER = 1) after regularisation. The remaining variables largely align with the logistic regression results, reinforcing consistency across models. In particular, SOFT_ASSETS_RATIO, LEASE_COMM, NULL_RSST_FLAG, and REVENUE_DIFF have positive coefficients, suggesting that higher values are associated with increased fraud risk, while variables such as REC_TO_SALES, ACCRUALS, ROA, DEBT_TO_EQUITY, Z_score, and INVENTORY_GROWTH are negatively associated with fraud, reflecting stronger financial health and operational stability.
+
+In terms of magnitude, SOFT_ASSETS_RATIO (β ≈ 1.66) and REC_TO_SALES (β ≈ −1.02) exhibit the largest effects in the model, indicating they are among the strongest predictors of fraud. For example, the coefficient for LEASE_COMM (β ≈ 0.1343) implies that a one-unit increase in the transformed variable is associated with an approximate 14.4% increase in the odds of fraud (e\^0.1343 = 1.144), holding other variables constant. Overall, the LASSO results not only reduce model complexity but also highlight a consistent and economically meaningful set of variables that drive fraud risk, further strengthening confidence in the key predictors identified across models.
+
+### Decision Tree
+
+```{r save-dt}
+#| results: hide
+#Export and resize the pruned decision tree to desired scale
+png("decision_tree.png", width = 5000, height = 3000, res = 150)
+rpart.plot(fit_dt$finalModel, type = 4, extra = 104,
+           main = "Pruned Decision Tree", cex = 0.7)
+dev.off()
+```
+
+```{r plot-dt}
+#| echo = FALSE
+knitr::include_graphics("decision_tree.png")
+```
+
+The pruned decision tree applies the 1-SE rule to select the simplest model within one standard error of the minimum cross-validation error, resulting in a more interpretable structure while avoiding overfitting. The tree’s splitting behaviour is consistent with the findings from the logistic regression and LASSO models, with LEASE_COMM appearing as the root split (LEASE_COMM \< 8.7). This reinforces its role as the most discriminating variable for fraud classification and aligns with its strong positive coefficient and statistical significance observed in earlier models.
+
+The left branch (LEASE_COMM \< 8.7), which represents the majority of observations (approximately 83% and largely NonFraud), exhibits deeper and more complex splitting patterns. In contrast, the right branch (LEASE_COMM ≥ 8.7) contains a higher concentration of fraud cases and requires fewer conditions to isolate high-risk firms, indicating that elevated lease commitments act as a strong primary trigger for fraud detection.
+
+High-Confidence Fraud Paths (≥ 90%)
+
+The tree identifies 7 terminal nodes where fraud probability exceeds 90%, representing the most reliable fraud signals. These paths are critical as they highlight combinations of variables under which firms are almost certainly classified as fraudulent.
+
+#### Path 1 — Fraud (90%)
+
+LEASE_COMM \< 8.7 → ACCRUALS ≥ -0.24 → margin_jump \< 0.95 → DEBT_TO_EQUITY ≥ -2 → Z_score ≥ 0.53 → ROA \< 5.4 → ROA \< -0.74 → INDUSTRY_DIFF ≥ 0.45 → REVENUE_DIFF \< 0.12
+
+Interpretation: This path captures firms with relatively lower lease commitments but very weak profitability (low ROA) combined with industry-relative anomalies and constrained revenue growth, suggesting potential underperformance masking or manipulation.
+
+#### Path 2 — Fraud (94%)
+
+LEASE_COMM \< 8.7 → ACCRUALS ≥ -0.24 → margin_jump \< 0.95 → DEBT_TO_EQUITY ≥ -2 → Z_score ≥ 0.53 → ROA \< 5.4 → ROA \< -0.74 → INDUSTRY_DIFF ≥ 0.45 → REVENUE_DIFF ≥ 0.12
+
+Interpretation: Similar to Path 1 but with higher revenue growth, which may indicate inconsistent signals between weak profitability and rising revenue, a potential red flag for revenue manipulation.
+
+#### Path 3 — Fraud (100%)
+
+LEASE_COMM \< 8.7 → ACCRUALS ≥ -0.24 → margin_jump \< 0.95 → DEBT_TO_EQUITY ≥ -2 → Z_score ≥ 0.53 → ROA \< 5.4 → ROA ≥ -0.74 → INDUSTRY_DIFF \< 0.45
+
+Interpretation: This path reflects a perfect fraud classification, where firms exhibit a combination of moderate profitability but abnormal positioning relative to industry benchmarks, suggesting structural inconsistencies.
+
+#### Path 4 — Fraud (92%)
+
+LEASE_COMM \< 8.7 → ACCRUALS ≥ -0.24 → margin_jump \< 0.95 → DEBT_TO_EQUITY ≥ -2 → Z_score \< 0.53 → DEBT_TO_EQUITY ≥ 3.6 → LEASE_COMM ≥ 0.96
+
+Interpretation: This highlights firms with weak financial health (low Z-score) and high leverage, even within lower lease commitment groups, indicating financial pressure that may incentivise fraud.
+
+#### Path 5 — Fraud (92%)
+
+LEASE_COMM ≥ 8.7 → REC_TO_SALES ≥ 0.51 → SOFT_ASSETS_RATIO ≥ -0.13 → ACCRUALS ≥ -0.17 → levi ≥ 1.1
+
+Interpretation: In high lease commitment firms, fraud is associated with aggressive revenue recognition (high REC_TO_SALES) and weaker asset quality, combined with leverage — a classic earnings manipulation pattern.
+
+#### Path 6 — Fraud (96%)
+
+LEASE_COMM ≥ 8.7 → ACCRUALS \< -0.16 → DEBT_TO_EQUITY ≥ 6.6
+
+Interpretation: This is one of the strongest signals: firms with extreme accrual behaviour and very high leverage are highly likely to be fraudulent, reflecting significant financial stress and accounting distortion.
+
+#### Path 7 — Fraud (91%)
+
+LEASE_COMM ≥ 8.7 → ACCRUALS \< -0.16 → DEBT_TO_EQUITY \< 6.6 → margin_jump ≥ 0.75
+
+Interpretation: Even when leverage is not extreme, the combination of abnormal accruals and unusually high profit growth signals potential manipulation of earnings performance.
+
+### Random Forest — Variable Importance
+
+```{r plot-rf-imp, fig.width=8, fig.height=6}
+rf_imp <- varImp(fit_rf)$importance
+rf_imp$Feature <- rownames(rf_imp)
+rf_imp <- rf_imp[order(-rf_imp$Overall), ][1:15, ]
+rf_imp$Overall_pct <- rf_imp$Overall / sum(rf_imp$Overall) * 100
+
+ggplot(rf_imp, aes(x = reorder(Feature, Overall_pct), y = Overall_pct)) +
+  geom_col(fill = "#4DAF4A") +
+  geom_text(aes(label = round(Overall_pct, 1)), hjust = -0.2, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +  # prevent labels being cut off
+  labs(title = "Top 15 Features — Random Forest", x = NULL, y = "Importance") +
+  theme_minimal(base_size = 12)
+
+```
+
+The Random Forest model identifies variable importance based on the mean decrease in node impurity (Gini importance) across all trees in the ensemble, providing a robust, aggregated view of each predictor's contribution to fraud classification. The results reveal a striking dominance of LEASE_COMM, with an importance score of 54.1, more than five times that of the second-ranked variable, ACCRUALS (10.3). This disproportionate gap underscores LEASE_COMM as the single most powerful discriminator of fraudulent firms in the dataset, consistent with its role as the root node split in the decision tree and its high significance and large positive coefficient in both the logistic regression and LASSO models. Its importance across all four model specifications provides particularly strong cross-model validation of its relevance as a fraud indicator.
+
+Beyond LEASE_COMM, the next tier of important variables — ACCRUALS (10.3), REC_TO_SALES (7.5), margin_jump (5.9), DEBT_TO_EQUITY (5.6), and Z_score (4.9), collectively capture earnings quality, leverage, and financial distress dimensions that have consistently appeared as meaningful predictors across models. ROA (2.9) and EMPLOYEE_DIFF (2.6) contribute moderately, with the latter serving as a proxy for operational irregularities such as unusual workforce changes that may accompany fraudulent reporting periods. Variables including net_margin (2.0), SOFT_ASSETS_RATIO (1.6), INVENTORY_GROWTH (0.9), DEBT_TO_ASSETS (0.8), FIRM_SIZE (0.6), ACC_REC_GROWTH (0.3), and M_score (0.2) register lower importance scores, suggesting that while they carry some discriminatory signal, their contribution is marginal once the stronger predictors are accounted for within the ensemble. Notably, SOFT_ASSETS_RATIO, which exhibited among the largest coefficient magnitudes in the LASSO model, ranks lower here, reflecting the difference between marginal predictive contribution in a regularised linear model versus relative impurity reduction across an ensemble of trees.
+
+Overall, the Random Forest importance rankings reinforce a consistent narrative: lease commitments, accruals quality, receivables intensity, and leverage structure are the primary drivers of fraud classification, while variables related to firm size, inventory changes, and composite scores such as M_score play a secondary, supporting role.
+
+### XGBoost — Variable Importance
+
+```{r plot-xgb-imp, fig.width=8, fig.height=6}
+xgb_imp <- varImp(fit_xgb)$importance
+xgb_imp$Feature <- rownames(xgb_imp)
+xgb_imp <- xgb_imp[order(-xgb_imp$Overall), ][1:15, ]
+xgb_imp$Overall_pct <- xgb_imp$Overall / sum(xgb_imp$Overall) * 100
+
+ggplot(xgb_imp, aes(x = reorder(Feature, Overall_pct), y = Overall_pct)) +
+  geom_col(fill = "#FF7F00") +
+  geom_text(aes(label = round(Overall_pct, 1)), hjust = -0.2, size = 3.5) +
+  coord_flip() +
+  labs(title = "Top 15 Features — XGBoost", x = NULL, y = "Importance") +
+  theme_minimal(base_size = 12)
+```
+
+The XGBoost model measures variable importance based on the gain metric, the average improvement in model accuracy contributed by a variable across all splits where it is used, providing a performance-weighted view of each predictor's contribution. As with the Random Forest, LEASE_COMM dominates with an importance score of 43.4, reaffirming its status as the most discriminating predictor of fraudulent behaviour across all model specifications. While its absolute importance score is lower than in the Random Forest (43.4 versus 54.1), its relative lead over all other variables remains substantial, with ACCRUALS ranking second at 10.6.
+
+The ordering of the top variables in XGBoost closely mirrors that of the Random Forest: ACCRUALS (10.6), REC_TO_SALES (8.3), margin_jump (8.1), DEBT_TO_EQUITY (6.4), and Z_score (4.6), suggesting broad consistency in which variables carry the most predictive signal, regardless of the ensemble method or objective function used. A notable difference is that EMPLOYEE_DIFF ranks higher in XGBoost (3.9) relative to its position in the Random Forest, while SOFT_ASSETS_RATIO drops to the bottom of the top 15 (1.4) in XGBoost compared to its stronger presence in the LASSO. This divergence likely reflects the gradient boosting framework's sequential correction of residuals, which may attribute less marginal gain to SOFT_ASSETS_RATIO once other correlated predictors have already been utilised in earlier boosting rounds.
+
+Variables in the lower tier: ACC_REC_GROWTH (1.6), FIRM_SIZE (1.6), INVENTORY_GROWTH (1.5), REVENUE_DIFF (1.5), DEBT_TO_ASSETS (1.4), and SOFT_ASSETS_RATIO (1.4), contribute modestly, functioning as auxiliary signals rather than primary fraud drivers. The broadly flat importance distribution across this lower tier, contrasted with the sharp drop-off from LEASE_COMM, suggests that the XGBoost model's discrimination power is heavily concentrated in a small core set of variables, with the remaining features providing incremental refinement rather than fundamental classification power.
+
+------------------------------------------------------------------------
+
+## Final Interpretation and Judgement
+
+### Model Interpretation Strategy and Rationale
+
+Although LASSO is selected as the final model due to its strong recall performance and overall stability, it is not used as the sole basis for interpretation. This is because LASSO primarily performs variable selection through coefficient shrinkage, focusing on the magnitude of coefficients rather than statistical significance, and does not provide clear thresholds or interpretable decision rules for practitioners.
+
+Given that all models (Logistic Regression, Decision Tree, Random Forest, and XGBoost) exhibit comparable performance on the test set, it is more robust to adopt a cross-model validation approach for interpretation. Specifically, variables that are consistently identified as important across different model types, including statistical significance (logistic regression), feature importance (tree-based models), and splitting behaviour (decision tree), are more likely to represent true underlying drivers of fraud, rather than model-specific artefacts.
+
+In addition, the inclusion of the decision tree allows us to derive explicit threshold-based rules, which enhances interpretability by showing that when certain variables exceed specific levels, firms are more likely to be classified as fraudulent. This is particularly valuable in a forensic or audit context, where actionable insights and clear decision boundaries are required.
+
+### Common Significant Variables Across Models
+
+By comparing results across logistic regression, decision tree, and ensemble models (Random Forest and XGBoost), a consistent set of variables emerges as key predictors of fraud:
+
+1.  LEASE_COMM
+2.  ACCRUALS
+3.  REC_TO_SALES
+4.  SOFT_ASSETS_RATIO
+5.  DEBT_TO_EQUITY
+6.  ROA
+7.  Z_score
+
+These variables are:
+
+-   Statistically significant in logistic regression (p \< 0.05)
+-   Ranked highly in feature importance for Random Forest and XGBoost
+-   Frequently used as splitting variables in the decision tree
+
+### Final Interpretation (Economic Meaning)
+
+Finally, we recommend that EY adopts our 4-step KYC screening rule, derived from the decision tree model, to identify firms that may be at elevated risk of fraud.
+
+We focus on the highlighted decision path below, which yields an 88% observed fraud rate and is driven by variables that are both statistically significant and economically meaningful.
+
+```{r plot-dt-chosen-path}
+#| echo = FALSE
+knitr::include_graphics("decision_tree_chosen_path.png")
+```
+
+After reversing the log transformation, firms that satisfy all four conditions below fall into this high-risk segment and should be prioritised for further investigation at an early stage:
+
+1.  Lease Commitments ≥ \~6,000
+2.  Accruals ≥ \~ -0.17
+3.  Debt-to-Equity ≥ \~735% (≈ 7.35×)
+4.  Receivables-to-Sales \< \~67%
+
+### Integrated Interpretation
+
+This rule captures a consistent profile of firms under financial pressure with signs of accounting-driven earnings distortion:
+
+-   High lease commitments indicate substantial fixed obligations, creating pressure to sustain performance and meet contractual payments.
+-   High leverage (debt-to-equity ≥ \~735%) reflects an extremely debt-heavy capital structure, increasing financial distress risk and incentivising stronger reported performance.
+-   Accruals ≥ \~ -0.17 suggest a greater reliance on accounting adjustments relative to cash flows, pointing to lower earnings quality and potential earnings manipulation.
+-   Receivables-to-sales \< \~67% indicates that fraud in this segment is less likely driven by receivables inflation, and more likely through accrual-based or broader accounting manipulation.
+
+In combination, this segment reflects firms that:
+
+-   face significant financial pressure (high leverage and fixed obligations)
+-   exhibit abnormal accounting behaviour (divergence between earnings and cash flow)
+-   may be incentivised to misrepresent financial performance.
+
+This provides a strong economic rationale for fraudulent behaviour and explains the elevated fraud rate observed in this segment.
+
+Overall, firms exhibiting both high financial pressure and signs of accounting distortion are significantly more likely to be fraudulent, supporting the use of this rule as an effective early-stage screening tool.
+
+## References
+
+Ahlawat, P., O’Niell, C., Mohan, A., & Wiles, T. (2022, October 5). *Solving Software’s R&D Conundrum*. Boston Consulting Group. Retrieved from <https://www.bcg.com/publications/2022/software-companies-tackling-research-and-development-conundrum?>
+
+Altman, E. I., Iwanicz‐Drozdowska, M., Laitinen, E. K., & Suvas, A. (2016). Financial Distress Prediction in an International Context: A Review and Empirical Analysis of Altman's Z‐Score Model. Journal of International Financial Management and Accounting, 28(2), 131-171. <https://doi.org/10.1111/jifm.12053>
+
+Brazel, J. F., Jones, K. L., & Lian, Q. (2024). Auditor Use of Benchmarks to Assess Fraud Risk: The Case for Industry Data. *Journal of Forensic Accounting Research*, *9*(1), 23–57. [https://doiorg.libproxy.smu.edu.sg/10.2308/JFAR-2023-037](https://research-ebsco-com.libproxy.smu.edu.sg/c/wj63el/viewer/pdf/l5finbgid5)
+
+Cheah, P. C. Y., Yang, Y., & Lee, B. G. (2023). *Enhancing financial fraud detection through addressing class imbalance using hybrid SMOTE‑GAN techniques*. *International Journal of Financial Studies, 11*(3), 110. <https://doi.org/10.3390/ijfs11030110>
+
+Christen, P. (2012). Data Matching: Concepts and Techniques for Record Linkage, Entity Resolution, and Duplicate Detection. Springer.
+
+Cokeley, E. D. (2018). *Predicting Accounting Misstatements Within Industries and Accounts*. ProQuest Dissertations & Theses. <https://surface.syr.edu/cgi/viewcontent.cgi?article=1988&context=etd>
+
+Dang, C., Li, Z. F., & Yang, C. (2018). Measuring firm size in empirical corporate finance. Journal of Banking & Finance, 86, 159–176. <https://doi.org/10.1016/j.jbankfin.2017.09.006>
+
+Detection of Fraudulent Financial Reporting using Ratio Analysis. (n.d.). *The œAsian Journal of Professional and Business Studies/˜The œAsian Journal of Professional & Business Studies*. <https://search.library.smu.edu.sg/permalink/65SMU_INST/175d9a4/cdi_unpaywall_primary_10_61688_ajpbs_v1i1_12>
+
+DECHOW, P. M., GE, W., LARSON, C. R., & SLOAN, R. G. (2011). Predicting Material Accounting Misstatements. *Contemporary Accounting Research*, *28*(1), 17--82. <https://doi.org/10.1111/j.1911-3846.2010.01041.x>
+
+Duan, W., Hu, N., & Xue, F. (2024). *The information content of financial statement fraud risk: An ensemble learning approach* (Working paper). Singapore Management University. <https://ink.library.smu.edu.sg/cgi/viewcontent.cgi?params=/context/sis_research/article/10672/&path_info=1.DSS_fraud_publication_version.pdf>
+
+Salekshahrezaee, Z., Leevy, J. L., & Khoshgoftaar, T. M. (2023). *The effect of feature extraction and data sampling on credit card fraud detection*. *Journal of Big Data, 10*(1), 6. [https://doi.org/10.1186/s40537‑023‑00684‑w](https://link.springer.com/article/10.1186/s40537-023-00684-w)
+
+Sylwestrzak M, Słomkowska J (2025;), "Evaluating the efficacy of modified Beneish and Dechow models for detecting earnings management in Polish companies". *Central European Management Journal*, Vol. ahead-of-print No. ahead-of-print. <https://doi.org/10.1108/CEMJ-07-2024-0225>
+
+Zhu, S., Ma, T., Wu, H., Ren, J., He, D., Li, Y., & Ge, R. (2025). Expanding and interpreting financial statement fraud detection using supply chain knowledge graphs. *Journal of Theoretical and Applied Electronic Commerce Research*, *20*(1), 442–463. <https://doi.org/10.3390/jtaer20010026>
